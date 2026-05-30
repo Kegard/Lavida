@@ -1,0 +1,181 @@
+{
+  "dataset_path": "lmms-lab/textvqa",
+  "dataset_name": null,
+  "split": "validation",
+  "pretrained": "weight/lavida",
+  "vision_tower": "weight/siglip",
+  "model_name": "llava_llada",
+  "conv_template": "llada",
+  "max_new_tokens": 32,
+  "block_length": 32,
+  "step_ratio": 1.0,
+  "remasking": "margin",
+  "schedule": null,
+  "schedule_kwargs": null,
+  "num_samples": 1000,
+  "mean_final_exact_match": 0.4902000000000003,
+  "step_summary": [
+    {
+      "step": 1,
+      "mean_exact_match": 0.3818000000000003,
+      "count": 1000
+    },
+    {
+      "step": 2,
+      "mean_exact_match": 0.37980000000000025,
+      "count": 1000
+    },
+    {
+      "step": 3,
+      "mean_exact_match": 0.3831000000000003,
+      "count": 1000
+    },
+    {
+      "step": 4,
+      "mean_exact_match": 0.38040000000000024,
+      "count": 1000
+    },
+    {
+      "step": 5,
+      "mean_exact_match": 0.3814000000000002,
+      "count": 1000
+    },
+    {
+      "step": 6,
+      "mean_exact_match": 0.3844000000000002,
+      "count": 1000
+    },
+    {
+      "step": 7,
+      "mean_exact_match": 0.3841000000000002,
+      "count": 1000
+    },
+    {
+      "step": 8,
+      "mean_exact_match": 0.38180000000000025,
+      "count": 1000
+    },
+    {
+      "step": 9,
+      "mean_exact_match": 0.3834000000000002,
+      "count": 1000
+    },
+    {
+      "step": 10,
+      "mean_exact_match": 0.3824000000000002,
+      "count": 1000
+    },
+    {
+      "step": 11,
+      "mean_exact_match": 0.38370000000000026,
+      "count": 1000
+    },
+    {
+      "step": 12,
+      "mean_exact_match": 0.3851000000000002,
+      "count": 1000
+    },
+    {
+      "step": 13,
+      "mean_exact_match": 0.3834000000000002,
+      "count": 1000
+    },
+    {
+      "step": 14,
+      "mean_exact_match": 0.3861000000000002,
+      "count": 1000
+    },
+    {
+      "step": 15,
+      "mean_exact_match": 0.38330000000000025,
+      "count": 1000
+    },
+    {
+      "step": 16,
+      "mean_exact_match": 0.3841000000000003,
+      "count": 1000
+    },
+    {
+      "step": 17,
+      "mean_exact_match": 0.38130000000000025,
+      "count": 1000
+    },
+    {
+      "step": 18,
+      "mean_exact_match": 0.38400000000000023,
+      "count": 1000
+    },
+    {
+      "step": 19,
+      "mean_exact_match": 0.3796000000000002,
+      "count": 1000
+    },
+    {
+      "step": 20,
+      "mean_exact_match": 0.3807000000000002,
+      "count": 1000
+    },
+    {
+      "step": 21,
+      "mean_exact_match": 0.37940000000000024,
+      "count": 1000
+    },
+    {
+      "step": 22,
+      "mean_exact_match": 0.38140000000000024,
+      "count": 1000
+    },
+    {
+      "step": 23,
+      "mean_exact_match": 0.38040000000000024,
+      "count": 1000
+    },
+    {
+      "step": 24,
+      "mean_exact_match": 0.3855000000000003,
+      "count": 1000
+    },
+    {
+      "step": 25,
+      "mean_exact_match": 0.3845000000000003,
+      "count": 1000
+    },
+    {
+      "step": 26,
+      "mean_exact_match": 0.38290000000000024,
+      "count": 1000
+    },
+    {
+      "step": 27,
+      "mean_exact_match": 0.38900000000000023,
+      "count": 1000
+    },
+    {
+      "step": 28,
+      "mean_exact_match": 0.39590000000000025,
+      "count": 1000
+    },
+    {
+      "step": 29,
+      "mean_exact_match": 0.40510000000000035,
+      "count": 1000
+    },
+    {
+      "step": 30,
+      "mean_exact_match": 0.45470000000000027,
+      "count": 1000
+    },
+    {
+      "step": 31,
+      "mean_exact_match": 0.4715000000000003,
+      "count": 1000
+    },
+    {
+      "step": 32,
+      "mean_exact_match": 0.4902000000000003,
+      "count": 1000
+    }
+  ],
+  "elapsed_sec_total": 1670.2198696136475,
+  "output_jsonl": "Draft/textvqa_stepwise_eval_samples.jsonl"
+}

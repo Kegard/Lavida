@@ -13,7 +13,7 @@ from llava.model.language_model.llada.generate import generate as llada_generate
 from llava.model.language_model.llada.log_likelyhood import get_logits as llada_get_logits
 import json
 import time
-pretrained = "lavida-ckpts/lavida-llada-hd"
+pretrained = "weight/lavida"
 model_name = "llava_llada"
 device = "cuda"
 device_map = "cuda:0"
@@ -27,7 +27,7 @@ prompt_question = conv.get_prompt()
 print(prompt_question)
 vision_kwargs = None
 vision_kwargs = dict(
-    mm_vision_tower="google/siglip-so400m-patch14-384",
+    mm_vision_tower="weight/siglip",
     mm_resampler_type=None,
     mm_projector_type='mlp2x_gelu',
     mm_hidden_size=1152,

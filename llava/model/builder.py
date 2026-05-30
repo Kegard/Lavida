@@ -26,6 +26,18 @@ from llava.model.language_model.llava_llada import LlavaLladaForMaskedDiffusion,
 from llava.model.language_model.llava_dream import LlavaDreamForMaskedDiffusion
 
 
+def suppress_meta_parameter_load_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message=r"for .*: copying from a non-meta parameter in the checkpoint to a meta parameter in the current model, which is a no-op.*",
+        category=UserWarning,
+        module=r"torch\.nn\.modules\.module",
+    )
+
+
+suppress_meta_parameter_load_warnings()
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", torch_dtype="float16",attn_implementation="sdpa", customized_config=None, overwrite_config=None,resize_embeddings=True, **kwargs):
     kwargs["device_map"] = device_map
 

@@ -1,0 +1,47 @@
+{
+  "layer_idx": 31,
+  "target_step": 8,
+  "selected_tokens": "The dog content The",
+  "sink_index": 553,
+  "attention_mean_cosine_corr": 0.49273223713014613,
+  "per_query_sink_cos_positive_ratio": 1.0,
+  "per_query_sink_cos_min": 0.20380041003227234,
+  "per_query_sink_cos_mean": 0.275381863117218,
+  "per_query_sink_cos_max": 0.4255901873111725,
+  "sink_cosine_summary": {
+    "mean": 0.3548141419887543,
+    "median": 0.3547099828720093,
+    "p90": 0.5136134028434753,
+    "count": 128
+  },
+  "non_sink_cosine_summary": {
+    "mean": -0.17341527342796326,
+    "median": -0.18155404925346375,
+    "p90": -0.03343972936272621,
+    "count": 93184
+  },
+  "top10_attention_indices": [
+    553,
+    467,
+    336,
+    569,
+    673,
+    624,
+    174,
+    650,
+    720,
+    718
+  ],
+  "top10_mean_cosine_indices": [
+    553,
+    336,
+    467,
+    569,
+    650,
+    174,
+    673,
+    624,
+    725,
+    724
+  ]
+}

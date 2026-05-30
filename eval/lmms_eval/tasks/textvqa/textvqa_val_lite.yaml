@@ -23,6 +23,7 @@ lmms_eval_specific_kwargs:
   default:
     pre_prompt: ""
     post_prompt: "\nAnswer the question using a single word or phrase."
+    prompt_mode: short
     ocr: false
   qwen_vl:
     pre_prompt: ""
@@ -31,4 +32,3 @@ generation_kwargs:
   max_new_tokens: 32
   temperature: 0
   do_sample: False
-

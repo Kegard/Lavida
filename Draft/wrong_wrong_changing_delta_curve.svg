@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="420">
+<rect x="0" y="0" width="900" height="420" fill="white"/>
+<text x="450.0" y="28" text-anchor="middle" font-size="18" font-family="Arial">wrong-&gt;wrong changing: mean Δ_t over step</text>
+<line x1="70" y1="50" x2="70" y2="350" stroke="#333" stroke-width="1.5"/>
+<line x1="70" y1="350" x2="870" y2="350" stroke="#333" stroke-width="1.5"/>
+<line x1="70" y1="50.00" x2="870" y2="50.00" stroke="#adb5bd" stroke-dasharray="6,4" stroke-width="1.2"/>
+<polyline fill="none" stroke="#c2255c" stroke-width="2.5" points="70.00,135.29 95.81,136.55 121.61,136.50 147.42,137.27 173.23,137.70 199.03,137.84 224.84,138.85 250.65,139.28 276.45,139.73 302.26,140.16 328.06,141.15 353.87,141.69 379.68,142.15 405.48,142.77 431.29,143.29 457.10,144.21 482.90,146.61 508.71,147.21 534.52,148.53 560.32,149.90 586.13,152.58 611.94,157.11 637.74,164.12 663.55,170.76 689.35,180.23 715.16,190.17 740.97,204.06 766.77,229.94 792.58,256.88 818.39,296.34 844.19,319.68 870.00,350.00"/>
+<text x="62" y="354.00" text-anchor="end" font-size="11" font-family="Arial">-16.342</text>
+<text x="62" y="54.00" text-anchor="end" font-size="11" font-family="Arial">0.000</text>
+<text x="62" y="54.00" text-anchor="end" font-size="11" font-family="Arial">0.000</text>
+<text x="70.00" y="368.00" text-anchor="middle" font-size="11" font-family="Arial">1</text>
+<text x="482.90" y="368.00" text-anchor="middle" font-size="11" font-family="Arial">17</text>
+<text x="870.00" y="368.00" text-anchor="middle" font-size="11" font-family="Arial">32</text>
+<circle cx="70.00" cy="135.29" r="4" fill="#d9480f"/>
+<text x="70.00" y="125.29" text-anchor="middle" font-size="11" font-family="Arial">max @ step 1: -4.646</text>
+</svg>

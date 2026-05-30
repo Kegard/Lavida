@@ -68,6 +68,13 @@ AVAILABLE_MODELS = {
     "whisper": "Whisper",
     "whisper_vllm": "WhisperVllm",
     "llava_llada":"Llava_Llada",
+    "llava_llada_scale":"Llava_Llada_Scale",
+    "llava_llada_reweight":"Llava_Llada_Reweight",
+    "llava_llada_reweight_prefill":"Llava_Llada_ReweightPrefill",
+    "llava_llada_sink":"Llava_Llada_Sink",
+    "llava_llada_vrg":"Llava_Llada_VRG",
+    "llava_llada_proposal_refine":"Llava_Llada_ProposalRefine",
+    "llava_llada_prefill_boost":"Llava_Llada_PrefillBoost",
     "llava_dream":"Llava_Dream"
 }
 

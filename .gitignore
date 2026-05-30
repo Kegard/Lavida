@@ -79,3 +79,46 @@ lavida-ckpts
 outputdir
 scripts/train/exps/local/
 data
+
+# LaViDa local data, weights, and generated artifacts
+datasets
+datasets/
+weight
+weight/
+/weights/
+/model_weights/
+/models/
+
+# Experiment outputs/results
+**/outputs/
+**/output/
+**/timestep_vrg_output/
+*.trace.pt
+*.trace.json
+*_trace.jsonl
+*unmask_trace.jsonl
+
+# Large model/checkpoint files
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+*.h5
+
+# Array/cache artifacts
+*.npy
+*.npz
+*.pkl
+*.pickle
+
+# Cluster/runtime files
+slurm-*.out
+*.err
+*.out
+nohup.out
+
+# Nested repository metadata copied from external projects
+**/.git/

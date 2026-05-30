@@ -143,7 +143,7 @@ import os
 DEBUG_PRINT_IMAGE_RES = os.environ.get("DEBUG_PRINT_IMAGE_RES", False)
 NOT_ALWASY_DO_2DPOOL = os.environ.get("NOT_ALWASY_DO_2DPOOL", False)
 ALWASY_DO_2DPOOL = not NOT_ALWASY_DO_2DPOOL
-# ALWASY_DO_2DPOOL = True
+ALWASY_DO_2DPOOL = False
 # breakpoint()
 
 def unpad_image(tensor, original_size):

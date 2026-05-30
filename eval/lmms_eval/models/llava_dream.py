@@ -133,10 +133,8 @@ class Llava_Dream(lmms):
         # try:
             # Try to load the model with the multimodal argument
             
-        if os.path.exists('/data1/jacklishufan/siglip-so400m-patch14-384'):
-            vision_tower_path = "/data1/jacklishufan/siglip-so400m-patch14-384"
-        else:
-            vision_tower_path="/data0/jacklishufan/siglip-so400m-patch14-384"
+
+        vision_tower_path="/data/jindong_gu/LaViDa/weight/siglip"
         # print(vision_tower_path)
         vision_kwargs = dict(
             mm_vision_tower=os.environ.get('LLADA_VISION_ENCODER',vision_tower_path),
