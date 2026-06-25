@@ -77,15 +77,23 @@ for path in (REPO_ROOT, EVAL_ROOT):
     if path_str not in sys.path:
         sys.path.insert(0, path_str)
 
-from Scale_Attention.reweight_patch import get_torch_dtype, maybe_disable_torch_compile
+from Scale_Attention.reweight_patch import (
+    build_prefix_from_multimodal_inputs,
+    get_torch_dtype,
+    maybe_disable_torch_compile,
+)
 from VRG.run_textvqa_visual_warmup import (
+    build_prompt,
     clean_generated_text,
     compute_textvqa_score,
+    construct_textvqa_prompt,
     load_textvqa_split,
     normalize_answers,
     prepare_prefix,
 )
 from VRG.timestep_vrg import build_unconditional_prefix_embeds
+from llava.constants import IMAGE_TOKEN_INDEX
+from llava.mm_utils import process_images, tokenizer_image_token
 from llava.model.language_model.llada.generate import add_gumbel_noise, get_num_transfer_tokens_sch
 from lmms_eval.tasks._task_utils.vqa_eval_metric import EvalAIAnswerProcessor
 
@@ -162,6 +170,42 @@ def parse_args():
         choices=["zeros", "mask_token"],
         help="How to remove visual evidence when computing visual-aware proposal scores.",
     )
+    parser.add_argument(
+        "--refine-guidance",
+        default="none",
+        choices=["none", "vcd"],
+        help="Optional logits guidance used only during the late refinement stage.",
+    )
+    parser.add_argument(
+        "--refine-weak-visual-mode",
+        default="diffusion_noise",
+        choices=["null_visual", "diffusion_noise"],
+        help="Weak visual condition for VCD-guided refinement logits.",
+    )
+    parser.add_argument(
+        "--vcd-refine-alpha",
+        type=float,
+        default=0.5,
+        help="Alpha in guided refinement logits: (1 + alpha) * logits(image) - alpha * logits(weak_visual).",
+    )
+    parser.add_argument(
+        "--refine-guidance-steps",
+        type=int,
+        default=None,
+        help="Apply refinement guidance only on the first k late-refine steps. If unset, use all refine steps.",
+    )
+    parser.add_argument(
+        "--vcd-noise-step",
+        type=int,
+        default=500,
+        help="Forward-diffusion timestep for --refine-weak-visual-mode diffusion_noise.",
+    )
+    parser.add_argument(
+        "--vcd-noise-seed",
+        type=int,
+        default=42,
+        help="Optional noise seed for --refine-weak-visual-mode diffusion_noise.",
+    )
     parser.add_argument("--print-every", type=int, default=10)
     return parser.parse_args()
 
@@ -229,6 +273,72 @@ def build_proposal_state(proposal_answer, remasked_answer_positions, prefix_leng
     return x_refine
 
 
+def add_diffusion_noise_tensor(image_tensor, noise_step, seed=None):
+    if not 0 <= int(noise_step) < 1000:
+        raise ValueError("--vcd-noise-step must be in [0, 999].")
+
+    device = image_tensor.device
+    dtype = image_tensor.dtype
+    betas = torch.linspace(-6, 6, 1000, device=device, dtype=torch.float32)
+    betas = torch.sigmoid(betas) * (0.5e-2 - 1e-5) + 1e-5
+    alphas = 1.0 - betas
+    alpha_bar = torch.cumprod(alphas, dim=0)[int(noise_step)]
+
+    if seed is None:
+        noise = torch.randn_like(image_tensor)
+    else:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        noise = torch.randn(image_tensor.shape, generator=generator, device=device, dtype=dtype)
+    return alpha_bar.sqrt().to(dtype) * image_tensor + (1.0 - alpha_bar).sqrt().to(dtype) * noise
+
+
+def add_diffusion_noise(images, noise_step, seed=None):
+    if isinstance(images, list):
+        return [
+            add_diffusion_noise_tensor(
+                image,
+                noise_step=noise_step,
+                seed=None if seed is None else int(seed) + idx,
+            )
+            for idx, image in enumerate(images)
+        ]
+    return add_diffusion_noise_tensor(images, noise_step=noise_step, seed=seed)
+
+
+def build_diffusion_noise_prefix(args, model, tokenizer, image_processor, doc):
+    image = doc["image"].convert("RGB")
+    context = construct_textvqa_prompt(
+        doc,
+        prompt_mode=getattr(args, "prompt_mode", "auto"),
+        pretrained_path=getattr(args, "pretrained", None),
+    )
+    prompt = build_prompt(context, args.conv_template)
+
+    image_tensor = process_images([image], image_processor, model.config)
+    dtype = get_torch_dtype(args.torch_dtype)
+    if isinstance(image_tensor, list):
+        image_tensor = [_image.to(dtype=dtype, device=args.device) for _image in image_tensor]
+    else:
+        image_tensor = image_tensor.to(dtype=dtype, device=args.device)
+    noisy_image_tensor = add_diffusion_noise(
+        image_tensor,
+        noise_step=args.vcd_noise_step,
+        seed=args.vcd_noise_seed,
+    )
+
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt").unsqueeze(0).to(args.device)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=args.device)
+    weak_prefix_embeds, _ = build_prefix_from_multimodal_inputs(
+        model=model,
+        input_ids=input_ids,
+        images=noisy_image_tensor,
+        image_sizes=[image.size],
+        attention_mask=attention_mask,
+    )
+    return weak_prefix_embeds
+
+
 def compute_visual_token_metrics(logits_cond, logits_uncond, x0):
     """计算 proposal token 的条件/无图分支差异，用于分析视觉证据是否真正起作用。"""
     cond_probs = F.softmax(logits_cond.to(torch.float64), dim=-1)
@@ -289,6 +399,13 @@ def run_proposal_then_refine(
     late_refine_steps,
     remask_policy="confidence",
     null_visual_mode="zeros",
+    refine_guidance="none",
+    refine_weak_visual_mode="diffusion_noise",
+    refine_weak_prefix_embeds=None,
+    vcd_refine_alpha=0.5,
+    refine_guidance_steps=None,
+    vcd_noise_step=500,
+    vcd_noise_seed=42,
 ):
     if cfg_scale > 0.0:
         raise NotImplementedError("cfg_scale > 0.0 is not supported in the native path.")
@@ -298,9 +415,18 @@ def run_proposal_then_refine(
         raise ValueError("--proposal-remask-ratio must be within [0, 1].")
     if late_refine_steps < 0:
         raise ValueError("--late-refine-steps must be >= 0.")
+    if refine_guidance_steps is not None and refine_guidance_steps <= 0:
+        raise ValueError("--refine-guidance-steps must be > 0 when set.")
     need_visual_analysis = remask_policy in {"vis_priority", "vis_confidence_priority"}
     if need_visual_analysis and prefix_input_ids_full is None:
         raise ValueError("prefix_input_ids_full is required for visual-aware remasking.")
+    if refine_guidance == "vcd":
+        if refine_weak_visual_mode == "null_visual" and prefix_input_ids_full is None:
+            raise ValueError("prefix_input_ids_full is required for null-visual VCD refinement.")
+        if refine_weak_visual_mode == "diffusion_noise" and refine_weak_prefix_embeds is None:
+            raise ValueError("refine_weak_prefix_embeds is required for diffusion-noise VCD refinement.")
+    elif refine_guidance != "none":
+        raise ValueError(f"Unsupported refine guidance: {refine_guidance}")
 
     device = prefix_embeds.device
     batch_size, prefix_length = prefix_embeds.shape[:2]
@@ -328,6 +454,20 @@ def run_proposal_then_refine(
             prefix_input_ids_full=prefix_input_ids_full,
             null_visual_mode=null_visual_mode,
         )
+
+    refine_uncond_prefix_embeds = None
+    if refine_guidance == "vcd":
+        if refine_weak_visual_mode == "null_visual":
+            refine_uncond_prefix_embeds, _ = build_unconditional_prefix_embeds(
+                core_model=core_model,
+                prefix_embeds=prefix_embeds,
+                prefix_input_ids_full=prefix_input_ids_full,
+                null_visual_mode=null_visual_mode,
+            )
+        elif refine_weak_visual_mode == "diffusion_noise":
+            refine_uncond_prefix_embeds = refine_weak_prefix_embeds
+        else:
+            raise ValueError(f"Unsupported refine weak visual mode: {refine_weak_visual_mode}")
 
     for block_idx in range(num_blocks):
         block_start = prefix_length + block_idx * block_length
@@ -494,6 +634,18 @@ def run_proposal_then_refine(
         current_embeds = core_model.transformer.wte(x_refine)
         current_embeds[:, :prefix_length] = prefix_embeds
         logits = core_model(None, input_embeddings=current_embeds).logits
+        guidance_used = (
+            refine_guidance == "vcd"
+            and (
+                refine_guidance_steps is None
+                or refine_step <= int(refine_guidance_steps)
+            )
+        )
+        if guidance_used:
+            weak_embeds = core_model.transformer.wte(x_refine)
+            weak_embeds[:, :prefix_length] = refine_uncond_prefix_embeds
+            weak_logits = core_model(None, input_embeddings=weak_embeds).logits
+            logits = (1.0 + float(vcd_refine_alpha)) * logits - float(vcd_refine_alpha) * weak_logits
 
         logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
         x0 = torch.argmax(logits_with_noise, dim=-1)
@@ -523,6 +675,7 @@ def run_proposal_then_refine(
                 "masked_before_step": int(masked_remaining),
                 "masked_after_step": int((x_refine[:, prefix_length:] == MASK_TOKEN_ID).sum().item()),
                 "selected_positions": [int(pos) for pos in select_index.detach().cpu().tolist()],
+                "guidance_used": bool(guidance_used),
                 "candidate_text": candidate_text,
                 "refine_state_text": refine_state_text,
             }
@@ -541,6 +694,22 @@ def run_proposal_then_refine(
         "num_remasked_positions": int(len(remasked_answer_positions)),
         "late_refine_steps_requested": int(late_refine_steps),
         "late_refine_steps_run": int(len(refine_records)),
+        "refine_guidance": refine_guidance,
+        "refine_weak_visual_mode": refine_weak_visual_mode if refine_guidance == "vcd" else None,
+        "vcd_refine_alpha": float(vcd_refine_alpha) if refine_guidance == "vcd" else None,
+        "refine_guidance_steps": int(refine_guidance_steps) if refine_guidance_steps is not None else None,
+        "vcd_noise_step": (
+            int(vcd_noise_step)
+            if refine_guidance == "vcd" and refine_weak_visual_mode == "diffusion_noise"
+            else None
+        ),
+        "vcd_noise_seed": (
+            int(vcd_noise_seed)
+            if refine_guidance == "vcd"
+            and refine_weak_visual_mode == "diffusion_noise"
+            and vcd_noise_seed is not None
+            else None
+        ),
     }
     output = {
         "proposal_text": proposal_text,
@@ -623,12 +792,22 @@ def main():
                 image_processor,
                 doc,
             )
+            refine_weak_prefix_embeds = None
+            if args.refine_guidance == "vcd" and args.refine_weak_visual_mode == "diffusion_noise":
+                refine_weak_prefix_embeds = build_diffusion_noise_prefix(
+                    args,
+                    model,
+                    tokenizer,
+                    image_processor,
+                    doc,
+                )
             normalized_answers = normalize_answers(doc, answer_processor)
             run_output = run_proposal_then_refine(
                 core_model=core_model,
                 tokenizer=tokenizer,
                 prefix_embeds=prefix_embeds,
                 prefix_input_ids_full=prefix_input_ids_full,
+                refine_weak_prefix_embeds=refine_weak_prefix_embeds,
                 max_new_tokens=args.max_new_tokens,
                 block_length=args.block_length,
                 step_per_block=args.step_per_block,
@@ -643,6 +822,12 @@ def main():
                 late_refine_steps=args.late_refine_steps,
                 remask_policy=args.remask_policy,
                 null_visual_mode=args.null_visual_mode,
+                refine_guidance=args.refine_guidance,
+                refine_weak_visual_mode=args.refine_weak_visual_mode,
+                vcd_refine_alpha=args.vcd_refine_alpha,
+                refine_guidance_steps=args.refine_guidance_steps,
+                vcd_noise_step=args.vcd_noise_step,
+                vcd_noise_seed=args.vcd_noise_seed,
             )
 
             proposal_score, proposal_prediction = compute_textvqa_score(
@@ -756,6 +941,22 @@ def main():
             "late_refine_steps": args.late_refine_steps,
             "remask_policy": args.remask_policy,
             "null_visual_mode": args.null_visual_mode,
+            "refine_guidance": args.refine_guidance,
+            "refine_weak_visual_mode": args.refine_weak_visual_mode if args.refine_guidance == "vcd" else None,
+            "vcd_refine_alpha": args.vcd_refine_alpha if args.refine_guidance == "vcd" else None,
+            "refine_guidance_steps": args.refine_guidance_steps,
+            "vcd_noise_step": (
+                args.vcd_noise_step
+                if args.refine_guidance == "vcd" and args.refine_weak_visual_mode == "diffusion_noise"
+                else None
+            ),
+            "vcd_noise_seed": (
+                args.vcd_noise_seed
+                if args.refine_guidance == "vcd"
+                and args.refine_weak_visual_mode == "diffusion_noise"
+                and args.vcd_noise_seed is not None
+                else None
+            ),
         },
         "proposal_mean_exact_match": proposal_score_total / written if written else None,
         "final_mean_exact_match": final_score_total / written if written else None,

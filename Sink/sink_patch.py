@@ -63,9 +63,28 @@ def infer_multimodal_layout(
     if visual_positions.numel() == 0:
         raise RuntimeError("No visual token positions found in the expanded multimodal prefix.")
 
+    visual_position_list = [int(idx) for idx in visual_positions.tolist()]
+    try:
+        vision_tower = model_obj.get_vision_tower()
+        if hasattr(vision_tower, "num_patches"):
+            expected_patches = int(vision_tower.num_patches)
+        elif hasattr(vision_tower, "num_patches_per_side"):
+            patches_per_side = int(vision_tower.num_patches_per_side)
+            expected_patches = patches_per_side * patches_per_side
+        else:
+            expected_patches = 0
+        if (
+            expected_patches > 0
+            and len(visual_position_list) == expected_patches + 1
+            and visual_position_list == list(range(visual_position_list[0], visual_position_list[0] + len(visual_position_list)))
+        ):
+            visual_position_list = visual_position_list[:expected_patches]
+    except Exception:
+        pass
+
     text_query_positions = [int(i) for i, token_id in enumerate(valid_ids.tolist()) if token_id != IMAGE_TOKEN_INDEX]
     return {
-        "visual_positions": [int(idx) for idx in visual_positions.tolist()],
+        "visual_positions": visual_position_list,
         "text_query_positions": text_query_positions,
         "prefix_length": int(valid_ids.shape[0]),
     }
@@ -113,10 +132,53 @@ def build_sink_config(**kwargs) -> Dict[str, Any]:
         "topk": max(1, _as_int(kwargs.get("topk", 1), 1)),
         "query_scope": str(kwargs.get("query_scope", "text")).strip().lower(),
         "control": str(kwargs.get("control", "none")).strip().lower(),
+        "head_scope": str(kwargs.get("head_scope", "all")).strip().lower(),
         "seed": _as_int(kwargs.get("seed", 0), 0),
         "debug": _as_bool(kwargs.get("debug", False)),
         "step_modes": parse_step_modes(str(kwargs.get("steps", "both"))),
     }
+
+
+def _parse_intervention_spec(spec: str) -> Tuple[str, float]:
+    value = (spec or "none").strip().lower()
+    soft_debias_match = re.fullmatch(r"positive_cos_soft_debias_(\d+(?:p\d+)?)(?:_t\d+(?:p\d+)?)?", value)
+    if soft_debias_match:
+        return "positive_cos_soft_debias", float(soft_debias_match.group(1).replace("p", "."))
+    outro_match = re.fullmatch(r"outro_rotate_(\d+(?:p\d+)?)(?:_t\d+(?:p\d+)?)?", value)
+    if outro_match:
+        return "outro_rotate", float(outro_match.group(1).replace("p", "."))
+    match = re.fullmatch(r"(direction_debias|direction_logit_penalty|partial_zero_v|logit_penalty)_(\d+(?:p\d+)?)", value)
+    if match:
+        return match.group(1), float(match.group(2).replace("p", "."))
+    if value == "positive_cos_soft_debias":
+        return value, 1.0
+    if value == "outro_rotate":
+        return value, 1.0
+    if value == "direction_debias":
+        return value, 0.5
+    if value == "direction_logit_penalty":
+        return value, 1.0
+    if value == "partial_zero_v":
+        return value, 0.5
+    if value == "logit_penalty":
+        return value, 2.0
+    return value, 0.0
+
+
+def _parse_soft_debias_threshold(spec: str) -> float:
+    value = (spec or "").strip().lower()
+    match = re.fullmatch(r"positive_cos_soft_debias_\d+(?:p\d+)?(?:_t(\d+(?:p\d+)?))?", value)
+    if match and match.group(1) is not None:
+        return float(match.group(1).replace("p", "."))
+    return 0.0
+
+
+def _parse_outro_temperature(spec: str) -> float:
+    value = (spec or "").strip().lower()
+    match = re.fullmatch(r"outro_rotate_\d+(?:p\d+)?(?:_t(\d+(?:p\d+)?))?", value)
+    if match and match.group(1) is not None:
+        return float(match.group(1).replace("p", "."))
+    return 0.1
 
 
 def _select_query_positions(
@@ -221,6 +283,33 @@ def _pick_visual_indices(
     cos_mean: torch.Tensor,
 ) -> torch.Tensor:
     select_k = min(topk, int(attn_mean.numel()))
+    direction_score = attn_mean * torch.clamp(cos_mean, min=0.0)
+    direction_mass_match = re.fullmatch(r"direction_sink_mass_(\d+(?:p\d+)?)", selector)
+    if direction_mass_match:
+        mass_ratio = float(direction_mass_match.group(1).replace("p", "."))
+        mass_ratio = max(0.0, min(1.0, mass_ratio))
+        order = torch.argsort(direction_score, descending=True)
+        sorted_score = direction_score.index_select(0, order)
+        total_score = sorted_score.sum()
+        if total_score > 0:
+            cumulative = torch.cumsum(sorted_score, dim=0) / total_score.clamp_min(1e-12)
+            count = int(torch.searchsorted(cumulative, torch.tensor(mass_ratio, device=cumulative.device), right=False).item()) + 1
+            return order[: max(1, min(count, int(order.numel())))]
+        return torch.argsort(attn_mean, descending=True)[:1]
+    if selector == "direction_sink":
+        order = torch.argsort(direction_score, descending=True)
+        if direction_score.index_select(0, order[:1]).item() > 0:
+            return order[:select_k]
+        return torch.argsort(attn_mean, descending=True)[:select_k]
+    positive_cos_match = re.fullmatch(r"positive_cos(?:_(\d+(?:p\d+)?))?", selector)
+    if positive_cos_match:
+        threshold = 0.0
+        if positive_cos_match.group(1) is not None:
+            threshold = float(positive_cos_match.group(1).replace("p", "."))
+        selected = torch.where(cos_mean > threshold)[0]
+        if selected.numel() > 0:
+            return selected
+        return torch.argsort(cos_mean, descending=True)[:1]
     if selector == "top_attn":
         return torch.argsort(attn_mean, descending=True)[:select_k]
     if selector == "top_cos":
@@ -250,6 +339,7 @@ def _select_sink_positions(
     selector: str,
     topk: int,
     control: str,
+    head_scope: str,
     seed: int,
 ) -> Dict[str, Any]:
     if not visual_positions:
@@ -259,6 +349,7 @@ def _select_sink_positions(
             "attn_mean": torch.empty((0,), dtype=torch.float32),
             "cos_mean": torch.empty((0,), dtype=torch.float32),
             "key_norm_mean": torch.empty((0,), dtype=torch.float32),
+            "head_mask": None,
         }
 
     query_idx = torch.as_tensor(list(query_positions), dtype=torch.long, device=q.device)
@@ -274,6 +365,7 @@ def _select_sink_positions(
     k_unit = F.normalize(k_sel.to(torch.float32), p=2, dim=-1, eps=1e-12)
     cos_mean = (q_unit.unsqueeze(-2) * k_unit.unsqueeze(-3)).sum(dim=-1).mean(dim=(0, 1, 2))
     key_norm_mean = k_sel.to(torch.float32).norm(dim=-1).mean(dim=(0, 1))
+    direction_score = attn_mean * torch.clamp(cos_mean, min=0.0)
 
     base_indices = _pick_visual_indices(
         selector=selector,
@@ -290,13 +382,33 @@ def _select_sink_positions(
         seed=seed,
     )
     actual_positions = visual_idx.index_select(0, final_indices)
+    head_mask = None
+    if head_scope != "all":
+        selected_idx = actual_positions
+        full_attn = F.softmax(attn_scores.index_select(2, query_idx).to(torch.float32), dim=-1)
+        visual_mass = full_attn.index_select(3, visual_idx).sum(dim=-1).mean(dim=(0, 2))
+        sink_mass = full_attn.index_select(3, selected_idx).sum(dim=-1).mean(dim=(0, 2))
+        if head_scope == "image":
+            head_score = visual_mass
+        elif head_scope == "sink":
+            head_score = sink_mass
+        elif head_scope == "image_sink":
+            head_score = visual_mass * sink_mass
+        else:
+            raise ValueError(f"Unsupported sink_head_scope value: {head_scope}")
+        threshold = head_score.mean()
+        head_mask = head_score >= threshold
+        if not bool(head_mask.any()):
+            head_mask = None
     return {
         "visual_local_indices": final_indices,
         "selected_key_positions": [int(x) for x in actual_positions.tolist()],
         "attn_mean": attn_mean.detach().cpu(),
         "cos_mean": cos_mean.detach().cpu(),
         "key_norm_mean": key_norm_mean.detach().cpu(),
+        "selected_direction_score": direction_score.index_select(0, final_indices).detach(),
         "base_visual_local_indices": base_indices.detach().cpu(),
+        "head_mask": head_mask,
     }
 
 
@@ -308,7 +420,8 @@ def _apply_sink_intervention(
     v_for_cache: torch.Tensor,
     selected_key_positions: Sequence[int],
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if intervention == "none" or not selected_key_positions:
+    intervention_name, intervention_value = _parse_intervention_spec(intervention)
+    if intervention_name in {"none", "direction_debias", "direction_logit_penalty", "outro_rotate"} or not selected_key_positions:
         return attn_scores, k_for_cache, v_for_cache
 
     selected = torch.as_tensor(list(selected_key_positions), dtype=torch.long, device=attn_scores.device)
@@ -316,19 +429,161 @@ def _apply_sink_intervention(
     updated_k = k_for_cache
     updated_v = v_for_cache
 
-    if intervention in {"mask_attn", "remove"}:
+    if intervention_name in {"mask_attn", "remove"}:
         updated_scores = updated_scores.clone()
         updated_scores.index_fill_(-1, selected, torch.finfo(updated_scores.dtype).min)
 
-    if intervention in {"zero_k", "remove"}:
+    if intervention_name == "logit_penalty":
+        penalty = float(intervention_value)
+        updated_scores = updated_scores.clone()
+        selected_scores = updated_scores.index_select(-1, selected) - penalty
+        updated_scores.index_copy_(-1, selected, selected_scores)
+
+    if intervention_name in {"zero_k", "remove"}:
         updated_k = updated_k.clone()
         updated_k.index_fill_(-2, selected, 0.0)
 
-    if intervention in {"zero_v", "remove"}:
+    if intervention_name in {"zero_v", "remove"}:
         updated_v = updated_v.clone()
         updated_v.index_fill_(-2, selected, 0.0)
 
+    if intervention_name == "partial_zero_v":
+        scale = float(intervention_value)
+        updated_v = updated_v.clone()
+        selected_v = updated_v.index_select(-2, selected) * scale
+        updated_v.index_copy_(-2, selected, selected_v)
+
     return updated_scores, updated_k, updated_v
+
+
+def _apply_direction_debias(
+    *,
+    q_for_attn: torch.Tensor,
+    k_for_attn: torch.Tensor,
+    selected_key_positions: Sequence[int],
+    alpha: float,
+) -> torch.Tensor:
+    if not selected_key_positions:
+        return k_for_attn
+
+    selected = torch.as_tensor(list(selected_key_positions), dtype=torch.long, device=k_for_attn.device)
+    mean_q = q_for_attn.to(torch.float32).mean(dim=-2, keepdim=True)
+    mean_q = F.normalize(mean_q, p=2, dim=-1, eps=1e-12).to(dtype=k_for_attn.dtype)
+
+    selected_k = k_for_attn.index_select(-2, selected)
+    projection = (selected_k * mean_q).sum(dim=-1, keepdim=True) * mean_q
+    debiased_k = selected_k - float(alpha) * projection
+
+    updated_k = k_for_attn.clone()
+    updated_k.index_copy_(-2, selected, debiased_k)
+    return updated_k
+
+
+def _apply_direction_logit_penalty(
+    *,
+    attn_scores: torch.Tensor,
+    selected_key_positions: Sequence[int],
+    selected_direction_score: torch.Tensor,
+    gamma: float,
+) -> torch.Tensor:
+    if not selected_key_positions:
+        return attn_scores
+
+    selected = torch.as_tensor(list(selected_key_positions), dtype=torch.long, device=attn_scores.device)
+    weights = selected_direction_score.to(device=attn_scores.device, dtype=torch.float32)
+    if weights.numel() != selected.numel():
+        weights = torch.ones_like(selected, dtype=torch.float32, device=attn_scores.device)
+    else:
+        weights = weights / weights.max().clamp_min(1e-12)
+    weights = weights.to(dtype=attn_scores.dtype)
+
+    updated_scores = attn_scores.clone()
+    selected_scores = updated_scores.index_select(-1, selected) - float(gamma) * weights.view(1, 1, 1, -1)
+    updated_scores.index_copy_(-1, selected, selected_scores)
+    return updated_scores
+
+
+def _apply_positive_cos_soft_debias(
+    *,
+    q_for_attn: torch.Tensor,
+    k_for_attn: torch.Tensor,
+    visual_positions: Sequence[int],
+    alpha: float,
+    threshold: float,
+) -> torch.Tensor:
+    if not visual_positions:
+        return k_for_attn
+
+    visual_idx = torch.as_tensor(list(visual_positions), dtype=torch.long, device=k_for_attn.device)
+    mean_q = q_for_attn.to(torch.float32).mean(dim=-2, keepdim=True)
+    mean_q = F.normalize(mean_q, p=2, dim=-1, eps=1e-12)
+
+    k_vis = k_for_attn.index_select(-2, visual_idx)
+    k_vis_unit = F.normalize(k_vis.to(torch.float32), p=2, dim=-1, eps=1e-12)
+    cos = (k_vis_unit * mean_q).sum(dim=-1, keepdim=True)
+
+    weights = torch.clamp(cos - float(threshold), min=0.0)
+    max_weight = weights.max()
+    if max_weight <= 0:
+        return k_for_attn
+    weights = weights / max_weight.clamp_min(1e-12)
+
+    mean_q = mean_q.to(dtype=k_for_attn.dtype)
+    projection = (k_vis * mean_q).sum(dim=-1, keepdim=True) * mean_q
+    debiased_k = k_vis - float(alpha) * weights.to(dtype=k_vis.dtype) * projection
+
+    updated_k = k_for_attn.clone()
+    updated_k.index_copy_(-2, visual_idx, debiased_k)
+    return updated_k
+
+
+def _apply_outro_rotate(
+    *,
+    attn_output: torch.Tensor,
+    v_for_attn: torch.Tensor,
+    selected_key_positions: Sequence[int],
+    query_len: int,
+    gamma: float,
+    temperature: float,
+    head_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if not selected_key_positions:
+        return attn_output
+
+    selected = torch.as_tensor(list(selected_key_positions), dtype=torch.long, device=attn_output.device)
+    selected = selected[(selected >= 0) & (selected < v_for_attn.shape[-2])]
+    if selected.numel() == 0:
+        return attn_output
+
+    sink_v = v_for_attn.index_select(-2, selected).mean(dim=-2, keepdim=True)
+    sink_v_float = sink_v.to(torch.float32)
+    output_float = attn_output.to(torch.float32)
+
+    sink_norm = sink_v_float.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    output_norm = output_float.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    cos = (output_float * sink_v_float).sum(dim=-1, keepdim=True) / (output_norm * sink_norm)
+    gate = torch.tanh(torch.clamp(cos, min=0.0) / max(float(temperature), 1e-6))
+
+    denom = (sink_v_float * sink_v_float).sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    projection_scale = (output_float * sink_v_float).sum(dim=-1, keepdim=True) / denom
+    rotated = output_float + float(gamma) * gate * projection_scale * sink_v_float
+
+    rotated_norm = rotated.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    rotated = output_norm * rotated / rotated_norm
+
+    if head_mask is not None:
+        head_mask = head_mask.to(device=attn_output.device, dtype=torch.bool)
+        if head_mask.numel() == attn_output.shape[1] and bool(head_mask.any()):
+            keep = ~head_mask.view(1, -1, 1, 1)
+            rotated = torch.where(keep, output_float, rotated)
+
+    if query_len == v_for_attn.shape[-2]:
+        query_selected = selected[selected < query_len]
+        if query_selected.numel() > 0:
+            rotated = rotated.clone()
+            rotated.index_copy_(-2, query_selected, output_float.index_select(-2, query_selected))
+
+    return rotated.to(dtype=attn_output.dtype)
 
 
 @contextmanager
@@ -392,7 +647,27 @@ def patch_attention_sink(
             q_for_attn, k_for_attn, v_for_attn = _repeat_kv_for_attention(q_for_attn, k_for_attn, v_for_cache)
             attn_scores = _compute_attention_scores(q_for_attn, k_for_attn, attention_bias, block_module)
 
-            if current_layer_state["selected_key_positions"] is None:
+            intervention_name, intervention_value = _parse_intervention_spec(sink_config["intervention"])
+            dynamic_selection = intervention_name == "direction_logit_penalty"
+            selected_direction_score = torch.empty((0,), dtype=torch.float32, device=attn_scores.device)
+
+            if intervention_name == "positive_cos_soft_debias":
+                threshold = _parse_soft_debias_threshold(sink_config["intervention"])
+                modified_k_for_attn = _apply_positive_cos_soft_debias(
+                    q_for_attn=q_for_attn,
+                    k_for_attn=k_for_attn,
+                    visual_positions=visual_positions,
+                    alpha=float(intervention_value),
+                    threshold=threshold,
+                )
+                modified_scores = _compute_attention_scores(q_for_attn, modified_k_for_attn, attention_bias, block_module)
+                present = (k_for_cache, v_for_cache) if use_cache else None
+                attn_weights = F.softmax(modified_scores, dim=-1).to(v_for_attn.dtype)
+                att = torch.matmul(attn_weights, v_for_attn)
+                att = att.transpose(1, 2).contiguous().view(B, T, C)
+                return block_module.attn_out(att), present
+
+            if dynamic_selection or current_layer_state["selected_key_positions"] is None:
                 query_positions = _select_query_positions(
                     current_stage=current_stage,
                     query_scope=sink_config["query_scope"],
@@ -409,6 +684,7 @@ def patch_attention_sink(
                         selector=sink_config["selector"],
                         topk=sink_config["topk"],
                         control=sink_config["control"],
+                        head_scope=sink_config["head_scope"],
                         seed=int(sink_config["seed"]) + int(re.sub(r"^\D+", "", layer_name_local) or 0),
                     )
                     current_layer_state["selected_key_positions"] = selection["selected_key_positions"]
@@ -417,6 +693,8 @@ def patch_attention_sink(
                     current_layer_state["cos_mean"] = selection["cos_mean"]
                     current_layer_state["key_norm_mean"] = selection["key_norm_mean"]
                     current_layer_state["base_visual_local_indices"] = selection["base_visual_local_indices"]
+                    current_layer_state["selected_direction_score"] = selection["selected_direction_score"]
+                    current_layer_state["head_mask"] = selection["head_mask"]
                     if sink_config["debug"]:
                         eval_logger.warning(
                             "Sink selection %s stage=%s positions=%s",
@@ -426,7 +704,10 @@ def patch_attention_sink(
                         )
 
             selected_key_positions = current_layer_state.get("selected_key_positions") or []
-            if sink_config["intervention"] == "none" or not selected_key_positions:
+            if "selected_direction_score" in current_layer_state:
+                selected_direction_score = current_layer_state["selected_direction_score"]
+            head_mask = current_layer_state.get("head_mask")
+            if intervention_name == "none" or not selected_key_positions:
                 present = (k_for_cache, v_for_cache) if use_cache else None
                 attn_weights = F.softmax(attn_scores, dim=-1).to(v_for_attn.dtype)
                 att = torch.matmul(attn_weights, v_for_attn)
@@ -456,9 +737,26 @@ def patch_attention_sink(
                 modified_k_for_attn = modified_k_cache
             _, modified_k_for_attn, modified_v_for_attn = _repeat_kv_for_attention(q_for_attn, modified_k_for_attn, modified_v_cache)
 
-            if sink_config["intervention"] in {"zero_k", "zero_v", "remove"}:
+            if intervention_name == "direction_debias":
+                modified_k_for_attn = _apply_direction_debias(
+                    q_for_attn=q_for_attn,
+                    k_for_attn=modified_k_for_attn,
+                    selected_key_positions=selected_key_positions,
+                    alpha=float(intervention_value),
+                )
                 modified_scores = _compute_attention_scores(q_for_attn, modified_k_for_attn, attention_bias, block_module)
-                if sink_config["intervention"] == "remove":
+
+            if intervention_name == "direction_logit_penalty":
+                modified_scores = _apply_direction_logit_penalty(
+                    attn_scores=attn_scores,
+                    selected_key_positions=selected_key_positions,
+                    selected_direction_score=selected_direction_score,
+                    gamma=float(intervention_value),
+                )
+
+            if intervention_name in {"zero_k", "zero_v", "partial_zero_v", "remove"}:
+                modified_scores = _compute_attention_scores(q_for_attn, modified_k_for_attn, attention_bias, block_module)
+                if intervention_name == "remove":
                     selected = torch.as_tensor(selected_key_positions, dtype=torch.long, device=modified_scores.device)
                     modified_scores = modified_scores.clone()
                     modified_scores.index_fill_(-1, selected, torch.finfo(modified_scores.dtype).min)
@@ -466,6 +764,16 @@ def patch_attention_sink(
             present = (modified_k_cache, modified_v_cache) if use_cache else None
             attn_weights = F.softmax(modified_scores, dim=-1).to(modified_v_for_attn.dtype)
             att = torch.matmul(attn_weights, modified_v_for_attn)
+            if intervention_name == "outro_rotate":
+                att = _apply_outro_rotate(
+                    attn_output=att,
+                    v_for_attn=modified_v_for_attn,
+                    selected_key_positions=selected_key_positions,
+                    query_len=int(q_for_attn.shape[-2]),
+                    gamma=float(intervention_value),
+                    temperature=_parse_outro_temperature(sink_config["intervention"]),
+                    head_mask=head_mask,
+                )
             att = att.transpose(1, 2).contiguous().view(B, T, C)
             return block_module.attn_out(att), present
 

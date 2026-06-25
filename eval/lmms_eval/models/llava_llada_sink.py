@@ -40,6 +40,7 @@ class Llava_Llada_Sink(Llava_Llada):
         sink_steps: str = "both",
         sink_query_scope: str = "text",
         sink_control: str = "none",
+        sink_head_scope: str = "all",
         sink_seed: int = 0,
         sink_debug: Union[bool, str] = False,
         **kwargs,
@@ -55,12 +56,13 @@ class Llava_Llada_Sink(Llava_Llada):
             steps=sink_steps,
             query_scope=sink_query_scope,
             control=sink_control,
+            head_scope=sink_head_scope,
             seed=sink_seed,
             debug=sink_debug,
         )
         if self._sink_enabled:
             eval_logger.warning(
-                "Enable sink intervention: intervention=%s selector=%s topk=%s layers=%s steps=%s query_scope=%s control=%s",
+                "Enable sink intervention: intervention=%s selector=%s topk=%s layers=%s steps=%s query_scope=%s control=%s head_scope=%s",
                 self._sink_config["intervention"],
                 self._sink_config["selector"],
                 self._sink_config["topk"],
@@ -68,6 +70,7 @@ class Llava_Llada_Sink(Llava_Llada):
                 ",".join(self._sink_config["step_modes"]),
                 self._sink_config["query_scope"],
                 self._sink_config["control"],
+                self._sink_config["head_scope"],
             )
 
     @contextmanager

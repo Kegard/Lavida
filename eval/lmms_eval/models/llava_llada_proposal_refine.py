@@ -17,7 +17,7 @@ from lmms_eval.models.llava_llada import Llava_Llada
 from lmms_eval.models.model_utils.load_video import read_video_pyav
 
 from Scale_Attention.reweight_patch import build_prefix_from_multimodal_inputs
-from VRG.run_textvqa_proposal_refine import run_proposal_then_refine
+from VRG.run_textvqa_proposal_refine import add_diffusion_noise, run_proposal_then_refine
 
 try:
     from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
@@ -67,6 +67,12 @@ class Llava_Llada_ProposalRefine(Llava_Llada):
         late_refine_steps: int = 8,
         remask_policy: str = "confidence",
         null_visual_mode: str = "zeros",
+        refine_guidance: str = "none",
+        refine_weak_visual_mode: str = "diffusion_noise",
+        vcd_refine_alpha: float = 0.5,
+        refine_guidance_steps: Optional[int] = None,
+        vcd_noise_step: int = 500,
+        vcd_noise_seed: Optional[int] = 42,
         **kwargs,
     ) -> None:
         self.proposal_refine_enable = parse_bool_like(proposal_refine_enable)
@@ -75,6 +81,12 @@ class Llava_Llada_ProposalRefine(Llava_Llada):
         self.late_refine_steps = int(late_refine_steps)
         self.remask_policy = str(remask_policy)
         self.null_visual_mode = str(null_visual_mode)
+        self.refine_guidance = str(refine_guidance)
+        self.refine_weak_visual_mode = str(refine_weak_visual_mode)
+        self.vcd_refine_alpha = float(vcd_refine_alpha)
+        self.refine_guidance_steps = None if refine_guidance_steps is None else int(refine_guidance_steps)
+        self.vcd_noise_step = int(vcd_noise_step)
+        self.vcd_noise_seed = None if vcd_noise_seed is None else int(vcd_noise_seed)
         super().__init__(
             pretrained=pretrained,
             truncation=truncation,
@@ -109,18 +121,34 @@ class Llava_Llada_ProposalRefine(Llava_Llada):
             text_outputs = self.tokenizer.batch_decode(sequences, skip_special_tokens=True)
             return [text_output.lstrip("!").strip() for text_output in text_outputs]
 
-        prefix_embeds, _prefix_input_ids_full = build_prefix_from_multimodal_inputs(
+        prefix_embeds, prefix_input_ids_full = build_prefix_from_multimodal_inputs(
             model=self.model,
             input_ids=input_ids,
             images=image_tensor,
             image_sizes=gen_kwargs.get("image_sizes", None),
             attention_mask=attention_masks,
         )
+        refine_weak_prefix_embeds = None
+        if self.refine_guidance == "vcd" and self.refine_weak_visual_mode == "diffusion_noise":
+            noisy_image_tensor = add_diffusion_noise(
+                image_tensor,
+                noise_step=self.vcd_noise_step,
+                seed=self.vcd_noise_seed,
+            )
+            refine_weak_prefix_embeds, _ = build_prefix_from_multimodal_inputs(
+                model=self.model,
+                input_ids=input_ids,
+                images=noisy_image_tensor,
+                image_sizes=gen_kwargs.get("image_sizes", None),
+                attention_mask=attention_masks,
+            )
 
         run_output = run_proposal_then_refine(
             core_model=self.model.get_model(),
             tokenizer=self.tokenizer,
             prefix_embeds=prefix_embeds,
+            prefix_input_ids_full=prefix_input_ids_full,
+            refine_weak_prefix_embeds=refine_weak_prefix_embeds,
             max_new_tokens=int(gen_kwargs["max_new_tokens"]),
             block_length=int(gen_kwargs["block_length"]),
             step_per_block=gen_kwargs.get("step_per_block", None),
@@ -135,6 +163,12 @@ class Llava_Llada_ProposalRefine(Llava_Llada):
             late_refine_steps=self.late_refine_steps,
             remask_policy=self.remask_policy,
             null_visual_mode=self.null_visual_mode,
+            refine_guidance=self.refine_guidance,
+            refine_weak_visual_mode=self.refine_weak_visual_mode,
+            vcd_refine_alpha=self.vcd_refine_alpha,
+            refine_guidance_steps=self.refine_guidance_steps,
+            vcd_noise_step=self.vcd_noise_step,
+            vcd_noise_seed=self.vcd_noise_seed,
         )
         return [run_output["final_text"].strip()]
 

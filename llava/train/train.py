@@ -1950,7 +1950,6 @@ def train(attn_implementation=None):
             target_modules=find_all_linear_names(model),
             lora_dropout=training_args.lora_dropout,
             bias=training_args.lora_bias,
-            task_type="CAUSAL_LM",
         )
         if training_args.bits == 16:
             if training_args.bf16:

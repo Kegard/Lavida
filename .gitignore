@@ -7,8 +7,11 @@ dist
 # Log
 *.log
 *.log.*
-# *.json
-# *.jsonl
+*.html*
+*.csv*
+*.json
+*.jsonl
+
 
 # Data
 !**/alpaca-data-conversation.json
