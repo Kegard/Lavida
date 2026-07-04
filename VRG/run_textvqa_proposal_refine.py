@@ -379,6 +379,40 @@ def build_remask_priority(base_confidence, visual_metrics, remask_policy):
     raise ValueError(f"Unsupported remask policy: {remask_policy}")
 
 
+def _max_softmax_probability(logits):
+    logits = logits.to(torch.float64)
+    return torch.exp(logits.max(dim=-1).values - torch.logsumexp(logits, dim=-1))
+
+
+def _apply_confidence_gate(cond_logits, guided_logits, answer_slice, tau):
+    cond_ans = cond_logits[:, answer_slice]
+    guided_ans = guided_logits[:, answer_slice]
+    use_guided = (
+        _max_softmax_probability(guided_ans)
+        - _max_softmax_probability(cond_ans)
+    ) > float(tau)
+    merged = cond_logits.clone()
+    merged[:, answer_slice] = torch.where(
+        use_guided.unsqueeze(-1), guided_ans, cond_ans,
+    )
+    return merged
+
+
+def _forward_with_prefix_cache(core_model, x, prefix_embeds, prefix_length, prefix_kv_cache=None):
+    answer_embeds = core_model.transformer.wte(x[:, prefix_length:])
+    if prefix_kv_cache is None:
+        output = core_model(None, input_embeddings=prefix_embeds, use_cache=True)
+        new_cache = output.attn_key_values
+        answer_output = core_model(None, input_embeddings=answer_embeds, past_key_values=new_cache)
+        full_logits = torch.zeros(x.shape[0], prefix_length + answer_embeds.shape[1], answer_output.logits.shape[-1], dtype=answer_output.logits.dtype, device=answer_output.logits.device)
+        full_logits[:, prefix_length:] = answer_output.logits
+        return full_logits, new_cache
+    output = core_model(None, input_embeddings=answer_embeds, past_key_values=prefix_kv_cache)
+    full_logits = torch.zeros(x.shape[0], prefix_length + answer_embeds.shape[1], output.logits.shape[-1], dtype=output.logits.dtype, device=output.logits.device)
+    full_logits[:, prefix_length:] = output.logits
+    return full_logits, prefix_kv_cache
+
+
 @torch.no_grad()
 def run_proposal_then_refine(
     core_model,
@@ -406,6 +440,8 @@ def run_proposal_then_refine(
     refine_guidance_steps=None,
     vcd_noise_step=500,
     vcd_noise_seed=42,
+    refine_confidence_gate_tau=None,
+    use_prefix_cache=True,
 ):
     if cfg_scale > 0.0:
         raise NotImplementedError("cfg_scale > 0.0 is not supported in the native path.")
@@ -469,6 +505,10 @@ def run_proposal_then_refine(
         else:
             raise ValueError(f"Unsupported refine weak visual mode: {refine_weak_visual_mode}")
 
+    cond_prefix_kv = None
+    uncond_prefix_kv = None
+    refine_weak_prefix_kv = None
+
     for block_idx in range(num_blocks):
         block_start = prefix_length + block_idx * block_length
         block_end = prefix_length + (block_idx + 1) * block_length
@@ -487,15 +527,25 @@ def run_proposal_then_refine(
             if block_mask_index.sum().item() == 0:
                 continue
 
-            current_embeds = core_model.transformer.wte(x)
-            current_embeds[:, :prefix_length] = prefix_embeds
-            logits = core_model(None, input_embeddings=current_embeds).logits
+            if use_prefix_cache:
+                logits, cond_prefix_kv = _forward_with_prefix_cache(
+                    core_model, x, prefix_embeds, prefix_length, cond_prefix_kv,
+                )
+            else:
+                current_embeds = core_model.transformer.wte(x)
+                current_embeds[:, :prefix_length] = prefix_embeds
+                logits = core_model(None, input_embeddings=current_embeds).logits
             logits_uncond = None
             visual_metrics = None
             if need_visual_analysis:
-                current_embeds_uncond = current_embeds.clone()
-                current_embeds_uncond[:, :prefix_length] = uncond_prefix_embeds
-                logits_uncond = core_model(None, input_embeddings=current_embeds_uncond).logits
+                if use_prefix_cache:
+                    logits_uncond, uncond_prefix_kv = _forward_with_prefix_cache(
+                        core_model, x, uncond_prefix_embeds, prefix_length, uncond_prefix_kv,
+                    )
+                else:
+                    current_embeds_uncond = core_model.transformer.wte(x)
+                    current_embeds_uncond[:, :prefix_length] = uncond_prefix_embeds
+                    logits_uncond = core_model(None, input_embeddings=current_embeds_uncond).logits
 
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1)
@@ -631,9 +681,14 @@ def run_proposal_then_refine(
         if masked_remaining == 0:
             break
 
-        current_embeds = core_model.transformer.wte(x_refine)
-        current_embeds[:, :prefix_length] = prefix_embeds
-        logits = core_model(None, input_embeddings=current_embeds).logits
+        if use_prefix_cache:
+            logits, cond_prefix_kv = _forward_with_prefix_cache(
+                core_model, x_refine, prefix_embeds, prefix_length, cond_prefix_kv,
+            )
+        else:
+            current_embeds = core_model.transformer.wte(x_refine)
+            current_embeds[:, :prefix_length] = prefix_embeds
+            logits = core_model(None, input_embeddings=current_embeds).logits
         guidance_used = (
             refine_guidance == "vcd"
             and (
@@ -642,10 +697,23 @@ def run_proposal_then_refine(
             )
         )
         if guidance_used:
-            weak_embeds = core_model.transformer.wte(x_refine)
-            weak_embeds[:, :prefix_length] = refine_uncond_prefix_embeds
-            weak_logits = core_model(None, input_embeddings=weak_embeds).logits
-            logits = (1.0 + float(vcd_refine_alpha)) * logits - float(vcd_refine_alpha) * weak_logits
+            cond_logits = logits
+            if use_prefix_cache:
+                weak_logits, refine_weak_prefix_kv = _forward_with_prefix_cache(
+                    core_model, x_refine, refine_uncond_prefix_embeds, prefix_length, refine_weak_prefix_kv,
+                )
+            else:
+                weak_embeds = core_model.transformer.wte(x_refine)
+                weak_embeds[:, :prefix_length] = refine_uncond_prefix_embeds
+                weak_logits = core_model(None, input_embeddings=weak_embeds).logits
+            guided_logits = (1.0 + float(vcd_refine_alpha)) * cond_logits - float(vcd_refine_alpha) * weak_logits
+            if refine_confidence_gate_tau is not None:
+                answer_slice = slice(prefix_length, prefix_length + max_new_tokens)
+                logits = _apply_confidence_gate(
+                    cond_logits, guided_logits, answer_slice, refine_confidence_gate_tau,
+                )
+            else:
+                logits = guided_logits
 
         logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
         x0 = torch.argmax(logits_with_noise, dim=-1)
@@ -698,6 +766,7 @@ def run_proposal_then_refine(
         "refine_weak_visual_mode": refine_weak_visual_mode if refine_guidance == "vcd" else None,
         "vcd_refine_alpha": float(vcd_refine_alpha) if refine_guidance == "vcd" else None,
         "refine_guidance_steps": int(refine_guidance_steps) if refine_guidance_steps is not None else None,
+        "refine_confidence_gate_tau": float(refine_confidence_gate_tau) if refine_confidence_gate_tau is not None else None,
         "vcd_noise_step": (
             int(vcd_noise_step)
             if refine_guidance == "vcd" and refine_weak_visual_mode == "diffusion_noise"

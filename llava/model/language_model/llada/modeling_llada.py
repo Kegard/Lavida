@@ -1344,7 +1344,8 @@ class LLaDAModel(nn.Module):
             if past_key_values is not None:
                 past_len = past_key_values[0][0].shape[-2]
                 def prefix_lm_dllm(b, h, q_idx, kv_idx):
-                    return  (kv_idx < prefix_length[b])|  (q_idx >= prefix_length[b])
+                    q_idx_real = q_idx + past_len
+                    return  (kv_idx < prefix_length[b])|  (q_idx_real >= prefix_length[b])
                 block_mask = create_block_mask(prefix_lm_dllm, B=_bsz, H=None, Q_LEN=_seq_len, KV_LEN=_seq_len+past_len)
             else:
                 def prefix_lm_dllm(b, h, q_idx, kv_idx):

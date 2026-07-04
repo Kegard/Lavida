@@ -73,6 +73,7 @@ class Llava_Llada_ProposalRefine(Llava_Llada):
         refine_guidance_steps: Optional[int] = None,
         vcd_noise_step: int = 500,
         vcd_noise_seed: Optional[int] = 42,
+        refine_confidence_gate_tau: Optional[float] = None,
         **kwargs,
     ) -> None:
         self.proposal_refine_enable = parse_bool_like(proposal_refine_enable)
@@ -87,6 +88,7 @@ class Llava_Llada_ProposalRefine(Llava_Llada):
         self.refine_guidance_steps = None if refine_guidance_steps is None else int(refine_guidance_steps)
         self.vcd_noise_step = int(vcd_noise_step)
         self.vcd_noise_seed = None if vcd_noise_seed is None else int(vcd_noise_seed)
+        self.refine_confidence_gate_tau = None if refine_confidence_gate_tau is None else float(refine_confidence_gate_tau)
         super().__init__(
             pretrained=pretrained,
             truncation=truncation,
@@ -169,6 +171,7 @@ class Llava_Llada_ProposalRefine(Llava_Llada):
             refine_guidance_steps=self.refine_guidance_steps,
             vcd_noise_step=self.vcd_noise_step,
             vcd_noise_seed=self.vcd_noise_seed,
+            refine_confidence_gate_tau=self.refine_confidence_gate_tau,
         )
         return [run_output["final_text"].strip()]
 
