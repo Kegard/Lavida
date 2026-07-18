@@ -26,17 +26,92 @@ from M3CoT.run_m3cot_stepwise_x0 import (
     prepare_prefix,
 )
 from M3CoT.utils.metric import judge_answer
-from Scale_Attention.reweight_patch import (
-    build_prefix_from_multimodal_inputs,
-    get_torch_dtype,
-    maybe_disable_torch_compile,
-)
-from VRG.timestep_vrg import build_unconditional_prefix_embeds
 from llava.constants import DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX
 from llava.conversation import conv_templates
 from llava.mm_utils import process_images, tokenizer_image_token
 from llava.model.language_model.llada.generate import add_gumbel_noise
 
+def build_unconditional_prefix_embeds(
+    core_model,
+    prefix_embeds: torch.Tensor,
+    prefix_input_ids_full: torch.Tensor,
+    null_visual_mode: str = "zeros",
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if prefix_input_ids_full.dim() != 1:
+        raise ValueError("prefix_input_ids_full must be a 1D tensor for timestep VRG.")
+
+    visual_mask = prefix_input_ids_full.eq(IMAGE_TOKEN_INDEX)
+    uncond_prefix_embeds = prefix_embeds.clone()
+    if not visual_mask.any():
+        return uncond_prefix_embeds, visual_mask
+
+    if null_visual_mode == "zeros":
+        null_visual = torch.zeros(
+            (1, 1, prefix_embeds.shape[-1]),
+            dtype=prefix_embeds.dtype,
+            device=prefix_embeds.device,
+        )
+    elif null_visual_mode == "mask_token":
+        null_visual = core_model.transformer.wte(
+            torch.tensor([MASK_TOKEN_ID], dtype=torch.long, device=prefix_embeds.device)
+        ).view(1, 1, -1).to(dtype=prefix_embeds.dtype)
+    else:
+        raise ValueError(f"Unsupported null_visual_mode: {null_visual_mode}")
+
+    uncond_prefix_embeds[:, visual_mask, :] = null_visual
+    return uncond_prefix_embeds, visual_mask
+
+
+def maybe_disable_torch_compile():
+    original_compile = getattr(torch, "compile", None)
+    if original_compile is None:
+        return lambda: None
+
+    def eager_compile(fn=None, *compile_args, **compile_kwargs):
+        if fn is None:
+            return lambda inner_fn: inner_fn
+        return fn
+
+    torch.compile = eager_compile
+
+    def restore():
+        torch.compile = original_compile
+
+    return restore
+
+
+def build_prefix_from_multimodal_inputs(
+    model,
+    input_ids: torch.Tensor,
+    images,
+    image_sizes,
+    attention_mask: torch.Tensor = None,
+):
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
+    else:
+        attention_mask = attention_mask.to(dtype=torch.bool, device=input_ids.device)
+
+    ret = model.prepare_inputs_labels_for_multimodal(
+        input_ids=input_ids,
+        position_ids=None,
+        attention_mask=attention_mask,
+        past_key_values=None,
+        labels=None,
+        images=images,
+        modalities=["image"],
+        image_sizes=image_sizes,
+        return_inputs=True,
+    )
+    return ret[4], ret[-1][0]
+
+
+def get_torch_dtype(name: str) -> torch.dtype:
+    return {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[name]
 
 def cli_value(flag, default):
     if flag not in sys.argv:
