@@ -6,6 +6,7 @@ import math
 import sys
 import time
 from pathlib import Path
+from typing import Tuple
 
 import datasets
 import torch
@@ -139,11 +140,22 @@ def apply_postvrg_defaults():
     confidence_threshold = cli_value("--refill-vrg-confidence-threshold", "0.9")
     confidence_gate_tau = cli_value("--refill-vrg-confidence-gate-tau", None)
     guidance_steps = cli_value("--refill-guidance-steps", None)
+    refine_prior = cli_value("--refine-prior", "none")
+    prior_top_k = cli_value("--prior-top-k", "8")
+    prior_alpha = cli_value("--prior-alpha", "0.5")
+    cond_mode = cli_value("--refill-cond-visual-mode", "crop")
+    weak_mode = cli_value("--refill-weak-visual-mode", "diffusion_noise")
+    refill_guidance = cli_value("--refill-guidance", "none")
     noise_step = cli_value("--vcd-noise-step", "500")
     sample_seed = cli_value("--sample-seed", "42")
     limit = cli_value("--limit", "400")
 
-    weak_tag = f"noise{noise_step}"
+    if weak_mode in ("diffusion_noise", "full_noise"):
+        weak_tag = f"fullnoise{noise_step}"
+    elif weak_mode == "spotlight":
+        weak_tag = f"spotlight_noise{noise_step}"
+    else:
+        weak_tag = safe_name(weak_mode)
     if calibration == "none":
         calib_tag = f"alpha{safe_name(alpha)}"
     elif calibration == "soft_confidence":
@@ -154,10 +166,18 @@ def apply_postvrg_defaults():
         calib_tag = f"{calibration}_alpha{safe_name(alpha)}"
     step_tag = "" if guidance_steps is None else f"_k{safe_name(guidance_steps)}"
     gate_tag = "" if confidence_gate_tau is None else f"_gate{safe_name(confidence_gate_tau)}"
+    prior_tag = ""
+    if refine_prior != "none":
+        prior_tag = (
+            f"_prior{safe_name(refine_prior)}"
+            f"_topk{safe_name(prior_top_k)}"
+            f"_alpha{safe_name(prior_alpha)}"
+        )
     default_output = (
         "M3CoT/PostVRG/outputs/"
-        f"postvrg_proposalconf_vcdrefill_{calib_tag}{step_tag}{gate_tag}_"
-        f"{weak_tag}_seed{sample_seed}_n{limit}"
+        f"postvrg_proposalconf_refill-{safe_name(refill_guidance)}_"
+        f"{calib_tag}{step_tag}{gate_tag}{prior_tag}_cond{safe_name(cond_mode)}"
+        f"_vs_{weak_tag}_seed{sample_seed}_n{limit}"
     )
 
     defaults = {
@@ -172,8 +192,9 @@ def apply_postvrg_defaults():
         "--postmask-steps": 16,
         "--fixed-set-size": 32,
         "--fixed-refill-per-step": 2,
-        "--refill-guidance": "vcd",
-        "--refill-weak-visual-mode": "diffusion_noise",
+        "--refill-guidance": refill_guidance,
+        "--refill-cond-visual-mode": cond_mode,
+        "--refill-weak-visual-mode": weak_mode,
         "--vcd-refill-alpha": alpha,
         "--refill-vrg-calibration": calibration,
         "--refill-vrg-confidence-threshold": confidence_threshold,
@@ -272,12 +293,34 @@ def parse_args():
         help="Fraction of draft steps that use --draft-guidance vcd, starting from the first draft step.",
     )
     parser.add_argument(
+        "--refill-cond-visual-mode",
+        default="full",
+        choices=["full", "crop", "spotlight"],
+        help=(
+            "Image used as the positive/conditional branch during refine. "
+            "full keeps the original image; crop/spotlight use the selected edge-region view."
+        ),
+    )
+    parser.add_argument(
         "--refill-weak-visual-mode",
         default="diffusion_noise",
-        choices=["diffusion_noise", "null_visual"],
+        choices=["diffusion_noise", "full_noise", "null_visual", "crop", "spotlight"],
         help="Weak visual condition for VCD-guided refill logits. "
-        "diffusion_noise = noised image; null_visual = no image (zero out image-token embeds).",
+        "full_noise/diffusion_noise = noised full image; null_visual = no image "
+        "(zero out image-token embeds); crop/spotlight = edge-region image used as the comparison branch.",
     )
+    parser.add_argument("--region-num", type=int, default=16,
+                        help="Number of adaptive regions for crop/spotlight comparison image selection.")
+    parser.add_argument("--region-quantile", type=float, default=0.5,
+                        help="Regions above this edge-density quantile are selected (0.5 = top half).")
+    parser.add_argument("--region-weight", type=float, default=2.5,
+                        help="Entropy exponent in the region-splitting complexity score.")
+    parser.add_argument("--region-feather", type=float, default=0.02,
+                        help="Region-mask feather (Gaussian sigma as fraction of image width).")
+    parser.add_argument("--region-min-highlight", type=int, default=4,
+                        help="Minimum number of highlight regions (fallback if threshold selects fewer).")
+    parser.add_argument("--crop-margin", type=float, default=0.1,
+                        help="Margin (fraction of box size) around the edge-crop foreground box.")
     parser.add_argument(
         "--vcd-refill-alpha",
         type=float,
@@ -310,6 +353,35 @@ def parse_args():
         type=int,
         default=None,
         help="Only for refill guidance: apply VRG on the first k refine steps, then fall back to normal refill.",
+    )
+    parser.add_argument(
+        "--refine-prior",
+        default="none",
+        choices=["none", "draft_topk_margin"],
+        help="Optional draft prior used during refine. draft_topk_margin adds a sparse top-k margin bias.",
+    )
+    parser.add_argument(
+        "--prior-top-k",
+        type=int,
+        default=8,
+        help="Number of committed draft logits to cache per answer position for --refine-prior draft_topk_margin.",
+    )
+    parser.add_argument(
+        "--prior-alpha",
+        type=float,
+        default=0.5,
+        help="Strength of the draft top-k margin bias added to refine logits.",
+    )
+    parser.add_argument(
+        "--record-prior-events",
+        action="store_true",
+        help="Record lightweight per-position logits/top-k diagnostics for draft prior analysis.",
+    )
+    parser.add_argument(
+        "--prior-event-top-k",
+        type=int,
+        default=8,
+        help="Number of crop/fused top logits to record when --record-prior-events is set.",
     )
     parser.add_argument(
         "--fixed-set-size",
@@ -384,9 +456,42 @@ def forward_logits(core_model, x, prefix_embeds, prefix_length, prefix_kv_cache=
     return core_model(None, input_embeddings=current_embeds).logits
 
 
+def forward_answer_logits(core_model, x, prefix_embeds, prefix_length, prefix_kv_cache=None):
+    if prefix_kv_cache is not None:
+        answer_embeds = core_model.transformer.wte(x[:, prefix_length:])
+        output = core_model(None, input_embeddings=answer_embeds, past_key_values=prefix_kv_cache)
+        return output.logits
+    current_embeds = core_model.transformer.wte(x)
+    current_embeds[:, :prefix_length] = prefix_embeds
+    return core_model(None, input_embeddings=current_embeds).logits[:, prefix_length:]
+
+
 def compute_prefix_kv_cache(core_model, prefix_embeds):
     output = core_model(None, input_embeddings=prefix_embeds, use_cache=True)
     return output.attn_key_values
+
+
+def forward_aligned_answer_only_logits(
+    core_model,
+    x,
+    prefix_embeds,
+    answer_prefix_length,
+    prefix_kv_cache=None,
+):
+    prefix_length = int(prefix_embeds.shape[1])
+    if prefix_length == int(answer_prefix_length):
+        return forward_answer_logits(core_model, x, prefix_embeds, prefix_length, prefix_kv_cache=prefix_kv_cache)
+
+    answer_ids = x[:, answer_prefix_length:]
+    aligned_x = torch.full(
+        (x.shape[0], prefix_length + answer_ids.shape[1]),
+        MASK_TOKEN_ID,
+        dtype=x.dtype,
+        device=x.device,
+    )
+    aligned_x[:, :prefix_length] = 0
+    aligned_x[:, prefix_length:] = answer_ids
+    return forward_answer_logits(core_model, aligned_x, prefix_embeds, prefix_length, prefix_kv_cache=prefix_kv_cache)
 
 
 def forward_aligned_answer_logits(
@@ -496,6 +601,98 @@ def build_diffusion_noise_prefix(args, model, tokenizer, image_processor, doc):
     return weak_prefix_embeds
 
 
+def build_prompt_inputs(args, tokenizer, doc):
+    image = doc["image"].convert("RGB")
+    context = build_prompt(doc, args.prompt)
+
+    conv = copy.deepcopy(conv_templates[args.conv_template])
+    conv.append_message(conv.roles[0], DEFAULT_IMAGE_TOKEN + "\n" + context)
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+    input_ids = tokenizer_image_token(
+        prompt,
+        tokenizer,
+        IMAGE_TOKEN_INDEX,
+        return_tensors="pt",
+    ).unsqueeze(0).to(args.device)
+    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=args.device)
+    return image, input_ids, attention_mask
+
+
+def process_single_image_prefix(args, model, tokenizer, image_processor, doc, proc_image):
+    image, input_ids, attention_mask = build_prompt_inputs(args, tokenizer, doc)
+    image_tensor = process_images([proc_image], image_processor, model.config)
+    dtype = get_torch_dtype(args.torch_dtype)
+    if isinstance(image_tensor, list):
+        image_tensor = [_image.to(dtype=dtype, device=args.device) for _image in image_tensor]
+    else:
+        image_tensor = image_tensor.to(dtype=dtype, device=args.device)
+
+    prefix_embeds, _ = build_prefix_from_multimodal_inputs(
+        model=model,
+        input_ids=input_ids,
+        images=image_tensor,
+        image_sizes=[image.size],
+        attention_mask=attention_mask,
+    )
+    return prefix_embeds
+
+
+def select_edge_regions(args, image):
+    from M3CoT.PostVRG.region_utils_final import image_to_gray_norm, select_highlight_regions
+
+    return select_highlight_regions(
+        image_to_gray_norm(image),
+        gps_num=args.region_num,
+        quantile=args.region_quantile,
+        weight=args.region_weight,
+        min_highlight=args.region_min_highlight,
+    )
+
+
+def build_crop_comparison_prefix(args, model, tokenizer, image_processor, doc, regions=None):
+    image = doc["image"].convert("RGB")
+    W, H = image.size
+    if regions is None:
+        regions = select_edge_regions(args, image)
+    regions_px, _, hi, _ = regions
+    hi_boxes = [regions_px[i] for i in range(len(regions_px)) if hi[i]]
+    if not hi_boxes:
+        hi_boxes = regions_px
+    x1 = min(b[0] for b in hi_boxes)
+    y1 = min(b[1] for b in hi_boxes)
+    x2 = max(b[2] for b in hi_boxes)
+    y2 = max(b[3] for b in hi_boxes)
+    mx = int(args.crop_margin * (x2 - x1))
+    my = int(args.crop_margin * (y2 - y1))
+    x1 = max(0, x1 - mx)
+    y1 = max(0, y1 - my)
+    x2 = min(W - 1, x2 + mx)
+    y2 = min(H - 1, y2 + my)
+    crop_image = image.crop((x1, y1, x2 + 1, y2 + 1)).resize((W, H))
+    return process_single_image_prefix(args, model, tokenizer, image_processor, doc, crop_image)
+
+
+def build_spotlight_comparison_prefix(args, model, tokenizer, image_processor, doc, regions=None):
+    from M3CoT.PostVRG.region_utils_final import apply_region_spotlight
+
+    image = doc["image"].convert("RGB")
+    if regions is None:
+        regions = select_edge_regions(args, image)
+    spot_image = apply_region_spotlight(
+        image,
+        gps_num=args.region_num,
+        quantile=args.region_quantile,
+        weight=args.region_weight,
+        feather_frac=args.region_feather,
+        noise_step=args.vcd_noise_step,
+        seed=args.vcd_noise_seed,
+        min_highlight=args.region_min_highlight,
+        regions=regions,
+    )
+    return process_single_image_prefix(args, model, tokenizer, image_processor, doc, spot_image)
+
+
 def choose_positions(scores, k):
     if k <= 0:
         return scores.new_empty(0, dtype=torch.long)
@@ -523,11 +720,47 @@ def apply_confidence_gated_refill_logits(cond_logits, guided_logits, answer_slic
     return logits
 
 
+def apply_confidence_gated_answer_logits(cond_answer_logits, guided_answer_logits, tau):
+    use_guided = (
+        max_softmax_probability(guided_answer_logits)
+        - max_softmax_probability(cond_answer_logits)
+    ) > float(tau)
+    return torch.where(
+        use_guided.unsqueeze(-1),
+        guided_answer_logits,
+        cond_answer_logits,
+    )
+
+
+def build_topk_logits_debug(logits, answer_pos, top_k, tokenizer=None):
+    vocab_size = int(logits.shape[-1])
+    k = min(max(int(top_k), 1), vocab_size)
+    values, ids = torch.topk(logits[answer_pos], k=k, dim=-1)
+    token_ids = [int(item) for item in ids.detach().cpu().tolist()]
+    entry = {
+        "topk_ids": token_ids,
+        "topk_logits": [float(item) for item in values.detach().cpu().tolist()],
+        "top1_id": token_ids[0] if token_ids else None,
+        "top1_logit": float(values[0].item()) if values.numel() else None,
+    }
+    if values.numel() >= 2:
+        entry["top1_top2_margin"] = float((values[0] - values[1]).item())
+    if values.numel() >= 1:
+        entry["top1_topk_margin"] = float((values[0] - values[-1]).item())
+    if tokenizer is not None:
+        entry["topk_tokens"] = [
+            tokenizer.decode([token_id], skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            for token_id in token_ids
+        ]
+    return entry
+
+
 @torch.no_grad()
 def generate_with_postmask(
     core_model,
     tokenizer,
     prefix_embeds,
+    refill_cond_prefix_embeds,
     draft_weak_prefix_embeds,
     refill_weak_prefix_embeds,
     max_new_tokens,
@@ -545,12 +778,18 @@ def generate_with_postmask(
     vcd_draft_alpha,
     draft_guidance_ratio,
     refill_guidance,
+    refill_cond_visual_mode,
     refill_weak_visual_mode,
     vcd_refill_alpha,
     refill_vrg_calibration,
     refill_vrg_confidence_threshold,
     refill_vrg_confidence_gate_tau,
     refill_guidance_steps,
+    refine_prior,
+    prior_top_k,
+    prior_alpha,
+    record_prior_events,
+    prior_event_top_k,
     vcd_noise_step,
     vcd_noise_seed,
 ):
@@ -589,6 +828,12 @@ def generate_with_postmask(
         raise ValueError("draft_guidance_ratio must be in [0, 1].")
     if refill_guidance_steps is not None and refill_guidance_steps <= 0:
         raise ValueError("refill_guidance_steps must be > 0 when set.")
+    if refine_prior == "draft_topk_margin" and prior_top_k <= 0:
+        raise ValueError("prior_top_k must be > 0 when --refine-prior draft_topk_margin is used.")
+    if record_prior_events and refine_prior != "draft_topk_margin":
+        raise ValueError("--record-prior-events requires --refine-prior draft_topk_margin.")
+    if record_prior_events and prior_event_top_k <= 0:
+        raise ValueError("prior_event_top_k must be > 0 when --record-prior-events is used.")
     draft_guidance_steps = 0
     if draft_guidance == "vcd":
         draft_guidance_steps = int(math.ceil(float(draft_steps) * float(draft_guidance_ratio)))
@@ -597,6 +842,13 @@ def generate_with_postmask(
     batch_size, prefix_length = prefix_embeds.shape[:2]
     if batch_size != 1:
         raise ValueError("generate_with_postmask currently expects batch size 1.")
+    if refill_cond_prefix_embeds is None:
+        refill_cond_prefix_embeds = prefix_embeds
+    if int(refill_cond_prefix_embeds.shape[1]) != int(prefix_length):
+        raise ValueError(
+            "refill_cond_prefix_embeds length must match the draft prefix length; "
+            "crop/spotlight images should be resized to the original size."
+        )
 
     def resolve_guidance_prefix(guidance, weak_prefix_embeds, phase_name):
         if guidance == "none":
@@ -604,11 +856,11 @@ def generate_with_postmask(
         if guidance != "vcd":
             raise ValueError(f"Unsupported {phase_name} guidance: {guidance}")
         if weak_prefix_embeds is None:
-            raise ValueError(f"VCD {phase_name} guidance requires diffusion-noise weak_prefix_embeds.")
+            raise ValueError(f"VCD {phase_name} guidance requires weak_prefix_embeds.")
         return weak_prefix_embeds
 
-    def apply_vcd_guidance(logits, x_state, weak_prefix_embeds, alpha, weak_kv_cache=None):
-        weak_logits = forward_aligned_answer_logits(
+    def apply_vcd_guidance(answer_logits, x_state, weak_prefix_embeds, alpha, weak_kv_cache=None):
+        weak_answer_logits = forward_aligned_answer_only_logits(
             core_model,
             x_state,
             weak_prefix_embeds,
@@ -616,17 +868,12 @@ def generate_with_postmask(
             prefix_kv_cache=weak_kv_cache,
         )
         if torch.is_tensor(alpha):
-            guided = logits.clone()
             answer_alpha = alpha.to(
-                device=logits.device,
-                dtype=logits.dtype,
+                device=answer_logits.device,
+                dtype=answer_logits.dtype,
             ).view(1, -1, 1)
-            guided[:, answer_slice] = (
-                logits[:, answer_slice]
-                + answer_alpha * (logits[:, answer_slice] - weak_logits[:, answer_slice])
-            )
-            return guided
-        return (1.0 + float(alpha)) * logits - float(alpha) * weak_logits
+            return answer_logits + answer_alpha * (answer_logits - weak_answer_logits)
+        return (1.0 + float(alpha)) * answer_logits - float(alpha) * weak_answer_logits
 
     def build_refill_vrg_alpha():
         if refill_vrg_calibration == "none":
@@ -645,6 +892,26 @@ def generate_with_postmask(
             )
         raise ValueError(f"Unsupported refill VRG calibration: {refill_vrg_calibration}")
 
+    def apply_draft_topk_margin_prior(answer_logits, answer_mask_index):
+        if refine_prior != "draft_topk_margin":
+            return answer_logits, answer_mask_index.new_empty(0, dtype=torch.long)
+        valid_positions = torch.nonzero(
+            answer_mask_index[0] & draft_prior_seen,
+            as_tuple=False,
+        ).view(-1)
+        if valid_positions.numel() == 0:
+            return answer_logits, valid_positions
+        guided_logits = answer_logits.clone()
+        prior_ids = draft_prior_ids[valid_positions]
+        prior_margin = draft_prior_margin[valid_positions].to(
+            device=answer_logits.device,
+            dtype=answer_logits.dtype,
+        )
+        bias = torch.zeros_like(guided_logits[0, valid_positions])
+        bias.scatter_add_(dim=-1, index=prior_ids, src=prior_margin)
+        guided_logits[0, valid_positions] += float(prior_alpha) * bias
+        return guided_logits, valid_positions
+
     draft_uncond_prefix_embeds = resolve_guidance_prefix(
         draft_guidance,
         draft_weak_prefix_embeds,
@@ -660,8 +927,15 @@ def generate_with_postmask(
     x[:, :prefix_length] = 0
     answer_slice = slice(prefix_length, prefix_length + max_new_tokens)
     proposal_confidence = torch.full((max_new_tokens,), float("inf"), dtype=torch.float64, device=device)
+    prior_k = min(max(int(prior_top_k), 1), int(core_model.transformer.wte.weight.shape[0]))
+    event_k = min(max(int(prior_event_top_k), 1), int(core_model.transformer.wte.weight.shape[0]))
+    draft_prior_ids = torch.zeros((max_new_tokens, prior_k), dtype=torch.long, device=device)
+    draft_prior_margin = torch.zeros((max_new_tokens, prior_k), dtype=torch.float32, device=device)
+    draft_prior_seen = torch.zeros((max_new_tokens,), dtype=torch.bool, device=device)
+    prior_events = []
 
     cond_prefix_kv = None
+    refill_cond_kv = None
     draft_weak_kv = None
     refill_weak_kv = None
 
@@ -669,30 +943,35 @@ def generate_with_postmask(
     for step_idx, num_to_fill in enumerate(draft_schedule, start=1):
         if cond_prefix_kv is None:
             cond_prefix_kv = compute_prefix_kv_cache(core_model, prefix_embeds)
-        logits = forward_logits(core_model, x, prefix_embeds, prefix_length, prefix_kv_cache=cond_prefix_kv)
+        answer_logits = forward_answer_logits(core_model, x, prefix_embeds, prefix_length, prefix_kv_cache=cond_prefix_kv)
         draft_guidance_used = draft_guidance == "vcd" and step_idx <= draft_guidance_steps
         if draft_guidance_used:
             if draft_weak_kv is None and draft_uncond_prefix_embeds is not None:
                 weak_prefix_len = int(draft_uncond_prefix_embeds.shape[1])
                 if weak_prefix_len == prefix_length:
                     draft_weak_kv = compute_prefix_kv_cache(core_model, draft_uncond_prefix_embeds)
-            logits = apply_vcd_guidance(
-                logits, x, draft_uncond_prefix_embeds, vcd_draft_alpha,
+            answer_logits = apply_vcd_guidance(
+                answer_logits, x, draft_uncond_prefix_embeds, vcd_draft_alpha,
                 weak_kv_cache=draft_weak_kv,
             )
-        logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-        x0 = torch.argmax(logits_with_noise, dim=-1)
-        confidence = compute_remasking_confidence(logits, x0, remasking)
-        proposal_confidence = confidence[0, answer_slice].detach().to(torch.float64)
+        answer_x0 = torch.argmax(add_gumbel_noise(answer_logits, temperature=temperature), dim=-1)
+        answer_confidence = compute_remasking_confidence(answer_logits, answer_x0, remasking)
+        proposal_confidence = answer_confidence[0].detach().to(torch.float64)
 
-        mask_index = x == MASK_TOKEN_ID
-        x0 = torch.where(mask_index, x0, x)
-        masked_confidence = torch.where(mask_index, confidence, -torch.inf)
+        answer_mask_index = x[:, answer_slice] == MASK_TOKEN_ID
+        answer_x0 = torch.where(answer_mask_index, answer_x0, x[:, answer_slice])
+        masked_confidence = torch.where(answer_mask_index, answer_confidence, -torch.inf)
 
-        transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=device)
-        _, select_index = torch.topk(masked_confidence[0], k=int(num_to_fill))
-        transfer_index[0, select_index] = True
-        x[transfer_index] = x0[transfer_index]
+        _, select_answer_index = torch.topk(masked_confidence[0], k=int(num_to_fill))
+        if refine_prior == "draft_topk_margin" and select_answer_index.numel() > 0:
+            selected_logits = answer_logits[0, select_answer_index]
+            topk_values, topk_ids = torch.topk(selected_logits, k=prior_k, dim=-1)
+            draft_prior_ids[select_answer_index] = topk_ids
+            draft_prior_margin[select_answer_index] = (
+                topk_values - topk_values[:, -1:].detach()
+            ).to(dtype=draft_prior_margin.dtype)
+            draft_prior_seen[select_answer_index] = True
+        x[0, prefix_length + select_answer_index] = answer_x0[0, select_answer_index]
 
         state_ids = x[0, answer_slice].detach().cpu().tolist()
         draft_records.append(
@@ -701,7 +980,7 @@ def generate_with_postmask(
                 "phase": "draft",
                 "guidance_used": bool(draft_guidance_used),
                 "num_filled": int(num_to_fill),
-                "selected_positions": [int(pos) for pos in select_index.detach().cpu().tolist()],
+                "selected_positions": [int(pos) for pos in select_answer_index.detach().cpu().tolist()],
                 "state_text": decode_answer(tokenizer, state_ids),
                 "num_masked_after_step": int((x[:, answer_slice] == MASK_TOKEN_ID).sum().item()),
             }
@@ -732,8 +1011,19 @@ def generate_with_postmask(
 
         selected_answer_positions = fixed_remask_positions
 
-        cond_logits = forward_logits(core_model, x, prefix_embeds, prefix_length, prefix_kv_cache=cond_prefix_kv)
-        logits = cond_logits
+        if refill_cond_kv is None:
+            if refill_cond_prefix_embeds is prefix_embeds:
+                refill_cond_kv = cond_prefix_kv
+            else:
+                refill_cond_kv = compute_prefix_kv_cache(core_model, refill_cond_prefix_embeds)
+        cond_answer_logits = forward_answer_logits(
+            core_model,
+            x,
+            refill_cond_prefix_embeds,
+            prefix_length,
+            prefix_kv_cache=refill_cond_kv,
+        )
+        answer_logits = cond_answer_logits
         guidance_active = (
             refill_guidance == "vcd"
             and (
@@ -746,44 +1036,80 @@ def generate_with_postmask(
                 weak_prefix_len = int(refill_uncond_prefix_embeds.shape[1])
                 if weak_prefix_len == prefix_length:
                     refill_weak_kv = compute_prefix_kv_cache(core_model, refill_uncond_prefix_embeds)
-            guided_logits = apply_vcd_guidance(
-                cond_logits,
+            guided_answer_logits = apply_vcd_guidance(
+                cond_answer_logits,
                 x,
                 refill_uncond_prefix_embeds,
                 build_refill_vrg_alpha(),
                 weak_kv_cache=refill_weak_kv,
             )
             if refill_vrg_confidence_gate_tau is not None:
-                logits = apply_confidence_gated_refill_logits(
-                    cond_logits=cond_logits,
-                    guided_logits=guided_logits,
-                    answer_slice=answer_slice,
+                answer_logits = apply_confidence_gated_answer_logits(
+                    cond_answer_logits=cond_answer_logits,
+                    guided_answer_logits=guided_answer_logits,
                     tau=refill_vrg_confidence_gate_tau,
                 )
             else:
-                logits = guided_logits
-        logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-        x0 = torch.argmax(logits_with_noise, dim=-1)
-        confidence = compute_remasking_confidence(logits, x0, remasking)
+                answer_logits = guided_answer_logits
+        answer_mask_index = x[:, answer_slice] == MASK_TOKEN_ID
+        prior_base_logits = answer_logits
+        answer_logits, prior_valid_positions = apply_draft_topk_margin_prior(answer_logits, answer_mask_index)
+        answer_x0 = torch.argmax(add_gumbel_noise(answer_logits, temperature=temperature), dim=-1)
+        answer_confidence = compute_remasking_confidence(answer_logits, answer_x0, remasking)
 
-        mask_index = x == MASK_TOKEN_ID
-        x0 = torch.where(mask_index, x0, x)
-        masked_confidence = torch.where(mask_index, confidence, -torch.inf)
-        masked_remaining = int(mask_index[:, answer_slice].sum().item())
+        answer_x0 = torch.where(answer_mask_index, answer_x0, x[:, answer_slice])
+        masked_confidence = torch.where(answer_mask_index, answer_confidence, -torch.inf)
+        masked_remaining = int(answer_mask_index.sum().item())
         if fixed_refill_per_step is not None:
             refill_count = min(int(fixed_refill_per_step), masked_remaining)
         else:
             refill_count = masked_remaining
-        transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=device)
-        _, refill_index = torch.topk(masked_confidence[0], k=refill_count)
-        transfer_index[0, refill_index] = True
-        x[transfer_index] = x0[transfer_index]
+        _, refill_answer_index = torch.topk(masked_confidence[0], k=refill_count)
+        if record_prior_events and prior_valid_positions.numel() > 0:
+            refilled_set = {int(pos) for pos in refill_answer_index.detach().cpu().tolist()}
+            for answer_pos in prior_valid_positions.detach().cpu().tolist():
+                answer_pos = int(answer_pos)
+                draft_ids = [int(item) for item in draft_prior_ids[answer_pos].detach().cpu().tolist()]
+                draft_margin = [float(item) for item in draft_prior_margin[answer_pos].detach().cpu().tolist()]
+                base_entry = build_topk_logits_debug(
+                    prior_base_logits[0],
+                    answer_pos,
+                    event_k,
+                    tokenizer=tokenizer,
+                )
+                fused_entry = build_topk_logits_debug(
+                    answer_logits[0],
+                    answer_pos,
+                    event_k,
+                    tokenizer=tokenizer,
+                )
+                prior_events.append({
+                    "step": int(draft_steps + local_step),
+                    "local_step": int(local_step),
+                    "answer_position": answer_pos,
+                    "refilled": answer_pos in refilled_set,
+                    "draft_prior_ids": draft_ids,
+                    "draft_prior_margin": draft_margin,
+                    "draft_prior_top1_id": draft_ids[0] if draft_ids else None,
+                    "base": base_entry,
+                    "fused": fused_entry,
+                    "base_top1_in_draft_topk": (
+                        base_entry["top1_id"] in draft_ids
+                        if base_entry["top1_id"] is not None
+                        else None
+                    ),
+                    "fused_top1_in_draft_topk": (
+                        fused_entry["top1_id"] in draft_ids
+                        if fused_entry["top1_id"] is not None
+                        else None
+                    ),
+                    "changed_top1_by_prior": base_entry["top1_id"] != fused_entry["top1_id"],
+                    "selected_x0_id": int(answer_x0[0, answer_pos].item()),
+                    "selected_confidence": float(answer_confidence[0, answer_pos].item()),
+                })
+        x[0, prefix_length + refill_answer_index] = answer_x0[0, refill_answer_index]
 
-        refilled_answer_positions = [
-            int(seq_pos - prefix_length)
-            for seq_pos in refill_index.detach().cpu().tolist()
-            if seq_pos >= prefix_length
-        ]
+        refilled_answer_positions = [int(pos) for pos in refill_answer_index.detach().cpu().tolist()]
 
         state_ids = x[0, answer_slice].detach().cpu().tolist()
         postmask_records.append(
@@ -813,6 +1139,7 @@ def generate_with_postmask(
         "draft_guidance_ratio": float(draft_guidance_ratio) if draft_guidance == "vcd" else None,
         "draft_guidance_steps": int(draft_guidance_steps) if draft_guidance == "vcd" else 0,
         "refill_guidance": refill_guidance,
+        "refill_cond_visual_mode": refill_cond_visual_mode,
         "refill_weak_visual_mode": refill_weak_visual_mode if refill_guidance == "vcd" else None,
         "vcd_refill_alpha": float(vcd_refill_alpha) if refill_guidance == "vcd" else None,
         "refill_vrg_calibration": refill_vrg_calibration if refill_guidance == "vcd" else None,
@@ -827,6 +1154,11 @@ def generate_with_postmask(
             else None
         ),
         "refill_guidance_steps": int(refill_guidance_steps) if refill_guidance_steps is not None else None,
+        "refine_prior": refine_prior,
+        "prior_top_k": int(prior_k) if refine_prior == "draft_topk_margin" else None,
+        "prior_alpha": float(prior_alpha) if refine_prior == "draft_topk_margin" else None,
+        "record_prior_events": bool(record_prior_events),
+        "prior_event_top_k": int(event_k) if record_prior_events else None,
         "vcd_noise_step": (
             int(vcd_noise_step)
             if draft_guidance == "vcd" or refill_guidance == "vcd"
@@ -842,7 +1174,7 @@ def generate_with_postmask(
         ),
         "proposal_confidence_mean": float(proposal_confidence.mean().item()),
     }
-    return {
+    output = {
         "draft_text": draft_text,
         "draft_answer_ids": draft_answer_ids,
         "draft_records": draft_records,
@@ -851,6 +1183,9 @@ def generate_with_postmask(
         "final_answer_ids": final_answer_ids,
         "meta": meta,
     }
+    if record_prior_events:
+        output["prior_events"] = prior_events
+    return output
 
 
 def main():
@@ -879,6 +1214,8 @@ def main():
         vision_kwargs=vision_kwargs,
         torch_dtype=args.torch_dtype,
     )
+    if args.conv_template in conv_templates:
+        conv_templates[args.conv_template].tokenizer = tokenizer
     model.eval()
     model.tie_weights()
     model.to(get_torch_dtype(args.torch_dtype))
@@ -921,8 +1258,16 @@ def main():
                 doc,
             )
 
+            edge_regions = None
+
+            def get_edge_regions():
+                nonlocal edge_regions
+                if edge_regions is None:
+                    edge_regions = select_edge_regions(args, doc["image"].convert("RGB"))
+                return edge_regions
+
             def build_weak_prefix(weak_visual_mode):
-                if weak_visual_mode == "diffusion_noise":
+                if weak_visual_mode in ("diffusion_noise", "full_noise"):
                     return build_diffusion_noise_prefix(
                         args,
                         model,
@@ -938,9 +1283,51 @@ def main():
                         null_visual_mode="zeros",
                     )
                     return weak_prefix_embeds
+                if weak_visual_mode == "crop":
+                    return build_crop_comparison_prefix(
+                        args,
+                        model,
+                        tokenizer,
+                        image_processor,
+                        doc,
+                        regions=get_edge_regions(),
+                    )
+                if weak_visual_mode == "spotlight":
+                    return build_spotlight_comparison_prefix(
+                        args,
+                        model,
+                        tokenizer,
+                        image_processor,
+                        doc,
+                        regions=get_edge_regions(),
+                    )
                 raise ValueError(f"Unsupported weak visual mode: {weak_visual_mode}")
 
+            def build_visual_prefix(visual_mode):
+                if visual_mode == "full":
+                    return prefix_embeds
+                if visual_mode == "crop":
+                    return build_crop_comparison_prefix(
+                        args,
+                        model,
+                        tokenizer,
+                        image_processor,
+                        doc,
+                        regions=get_edge_regions(),
+                    )
+                if visual_mode == "spotlight":
+                    return build_spotlight_comparison_prefix(
+                        args,
+                        model,
+                        tokenizer,
+                        image_processor,
+                        doc,
+                        regions=get_edge_regions(),
+                    )
+                raise ValueError(f"Unsupported visual mode: {visual_mode}")
+
             draft_weak_prefix_embeds = None
+            refill_cond_prefix_embeds = build_visual_prefix(args.refill_cond_visual_mode)
             refill_weak_prefix_embeds = None
             if args.draft_guidance == "vcd":
                 draft_weak_prefix_embeds = build_weak_prefix(args.draft_weak_visual_mode)
@@ -956,6 +1343,7 @@ def main():
                 core_model=core_model,
                 tokenizer=tokenizer,
                 prefix_embeds=prefix_embeds,
+                refill_cond_prefix_embeds=refill_cond_prefix_embeds,
                 draft_weak_prefix_embeds=draft_weak_prefix_embeds,
                 refill_weak_prefix_embeds=refill_weak_prefix_embeds,
                 max_new_tokens=args.max_new_tokens,
@@ -973,12 +1361,18 @@ def main():
                 vcd_draft_alpha=args.vcd_draft_alpha,
                 draft_guidance_ratio=args.draft_guidance_ratio,
                 refill_guidance=args.refill_guidance,
+                refill_cond_visual_mode=args.refill_cond_visual_mode,
                 refill_weak_visual_mode=args.refill_weak_visual_mode,
                 vcd_refill_alpha=args.vcd_refill_alpha,
                 refill_vrg_calibration=args.refill_vrg_calibration,
                 refill_vrg_confidence_threshold=args.refill_vrg_confidence_threshold,
                 refill_vrg_confidence_gate_tau=args.refill_vrg_confidence_gate_tau,
                 refill_guidance_steps=args.refill_guidance_steps,
+                refine_prior=args.refine_prior,
+                prior_top_k=args.prior_top_k,
+                prior_alpha=args.prior_alpha,
+                record_prior_events=args.record_prior_events,
+                prior_event_top_k=args.prior_event_top_k,
                 vcd_noise_step=args.vcd_noise_step,
                 vcd_noise_seed=args.vcd_noise_seed,
             )
@@ -1015,6 +1409,8 @@ def main():
                     "postmask_records": run_output["postmask_records"],
                     "meta": run_output["meta"],
                 }
+                if args.record_prior_events:
+                    record["prior_events"] = run_output.get("prior_events", [])
                 fout.write(json.dumps(record, ensure_ascii=False) + "\n")
                 fout.flush()
             written += 1
@@ -1057,6 +1453,7 @@ def main():
             "vcd_draft_alpha": args.vcd_draft_alpha if args.draft_guidance == "vcd" else None,
             "draft_guidance_ratio": args.draft_guidance_ratio if args.draft_guidance == "vcd" else None,
             "refill_guidance": args.refill_guidance,
+            "refill_cond_visual_mode": args.refill_cond_visual_mode,
             "refill_weak_visual_mode": args.refill_weak_visual_mode if args.refill_guidance == "vcd" else None,
             "vcd_refill_alpha": args.vcd_refill_alpha if args.refill_guidance == "vcd" else None,
             "refill_vrg_calibration": args.refill_vrg_calibration if args.refill_guidance == "vcd" else None,
@@ -1071,6 +1468,11 @@ def main():
                 else None
             ),
             "refill_guidance_steps": args.refill_guidance_steps,
+            "refine_prior": args.refine_prior,
+            "prior_top_k": args.prior_top_k if args.refine_prior == "draft_topk_margin" else None,
+            "prior_alpha": args.prior_alpha if args.refine_prior == "draft_topk_margin" else None,
+            "record_prior_events": args.record_prior_events,
+            "prior_event_top_k": args.prior_event_top_k if args.record_prior_events else None,
             "vcd_noise_step": (
                 args.vcd_noise_step
                 if args.draft_guidance == "vcd" or args.refill_guidance == "vcd"
@@ -1084,6 +1486,12 @@ def main():
                 )
                 else None
             ),
+            "region_num": args.region_num,
+            "region_quantile": args.region_quantile,
+            "region_weight": args.region_weight,
+            "region_feather": args.region_feather,
+            "region_min_highlight": args.region_min_highlight,
+            "crop_margin": args.crop_margin,
         },
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

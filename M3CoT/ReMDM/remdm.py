@@ -1,11 +1,12 @@
 import argparse
+import contextlib
 import json
 import sys
 import time
 from pathlib import Path
 
-import datasets
 import torch
+import torch.nn.functional as F
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,26 +22,72 @@ from M3CoT.run_m3cot_stepwise_x0 import (
     compute_remasking_confidence,
     prepare_prefix,
 )
+from M3CoT.PostVRG.dataset_adapters import add_dataset_adapter_args, load_postvrg_dataset
+from M3CoT.PostVRG.postvrg_final import get_torch_dtype, maybe_disable_torch_compile
 from M3CoT.utils.metric import judge_answer
-from Scale_Attention.reweight_patch import get_torch_dtype, maybe_disable_torch_compile
-from llava.model.language_model.llada.generate import add_gumbel_noise
+
+
+def cli_value(flag, default):
+    if flag not in sys.argv:
+        return default
+    idx = sys.argv.index(flag)
+    if idx + 1 >= len(sys.argv):
+        return default
+    return sys.argv[idx + 1]
+
+
+def add_default(flag, value):
+    if value is None:
+        return
+    if flag not in sys.argv:
+        sys.argv.extend([flag, str(value)])
+
+
+def safe_name(value):
+    return str(value).replace(".", "p").replace("-", "m")
+
+
+def apply_remdm_defaults():
+    sampler = cli_value("--sampler", "remdm-rescale")
+    eta = cli_value("--eta", "1.0")
+    sample_seed = cli_value("--sample-seed", "42")
+    limit = cli_value("--limit", "400")
+    default_output = (
+        "M3CoT/ReMDM/outputs/"
+        f"{sampler}_eta{safe_name(eta)}_seed{sample_seed}_n{limit}"
+    )
+    defaults = {
+        "--prompt": "cot",
+        "--max-new-tokens": 64,
+        "--block-length": 64,
+        "--step-ratio": 0.5,
+        "--limit": limit,
+        "--sample-mode": "random",
+        "--sample-seed": sample_seed,
+        "--sampler": sampler,
+        "--eta": eta,
+        "--output-dir": default_output,
+    }
+    for flag, value in defaults.items():
+        add_default(flag, value)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Run ReMDM-style iterative propose-remask decoding on M3CoT: "
-            "each step proposes several masked tokens, then remasks low-confidence tokens."
+            "Run ReMDM / MDLM masked-diffusion decoding on M3CoT-style "
+            "multimodal multiple-choice benchmarks."
         )
     )
     parser.add_argument("--dataset-path", default="LightChen2333/M3CoT")
-    parser.add_argument("--split", default="test", choices=["train", "validation", "test"])
+    parser.add_argument("--split", default="test")
+    add_dataset_adapter_args(parser)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=400)
     parser.add_argument("--domain-filter", default=None)
-    parser.add_argument("--sample-mode", default="random", choices=["sequential", "random"])
+    parser.add_argument("--sample-mode", default="sequential", choices=["sequential", "random"])
     parser.add_argument("--sample-seed", type=int, default=42)
-    parser.add_argument("--output-dir", default="M3CoT/ReMDM/outputs/remdm_m64_s32_p4_r2_seed42_n400")
+    parser.add_argument("--output-dir", default="M3CoT/ReMDM/outputs/remdm")
 
     parser.add_argument("--pretrained", default="weight/lavida-reason")
     parser.add_argument("--model-name", default="llava_llada")
@@ -55,24 +102,38 @@ def parse_args():
     parser.add_argument("--block-length", type=int, default=64)
     parser.add_argument("--step-per-block", type=int, default=None)
     parser.add_argument("--step-ratio", type=float, default=0.5)
-    parser.add_argument("--proposal-per-step", type=int, default=4)
-    parser.add_argument("--remask-per-step", type=int, default=2)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--remasking", default="low_confidence", choices=["low_confidence", "random", "entrophy", "margin"])
+
     parser.add_argument(
-        "--remask-scope",
-        default="filled",
-        choices=["filled", "new"],
-        help=(
-            "filled: remask the lowest-confidence tokens among all currently filled answer tokens; "
-            "new: remask only among tokens proposed in the current step."
-        ),
+        "--sampler",
+        default="remdm-rescale",
+        choices=["mdlm", "remdm-cap", "remdm-rescale", "remdm-conf", "remdm-loop"],
+        help="Reverse sampler. ReMDM variants mirror the public ReMDM implementation.",
+    )
+    parser.add_argument("--eta", type=float, default=1.0, help="ReMDM remasking strength.")
+    parser.add_argument("--eps", type=float, default=1e-5, help="Final reverse-time epsilon.")
+    parser.add_argument(
+        "--nucleus-p",
+        type=float,
+        default=1.0,
+        help="Top-p truncation applied to p(x0|xt) before the reverse update.",
     )
     parser.add_argument(
-        "--remask-final-step",
+        "--noise-removal",
         action="store_true",
-        help="Also remask after the final step. By default the final step is kept complete.",
+        default=True,
+        help="After the last reverse step, replace remaining masks with argmax denoiser predictions.",
     )
+    parser.add_argument(
+        "--no-noise-removal",
+        action="store_false",
+        dest="noise_removal",
+        help="Leave any final masks untouched for ablation.",
+    )
+    parser.add_argument("--loop-t-on", type=float, default=0.8)
+    parser.add_argument("--loop-t-off", type=float, default=0.2)
+    parser.add_argument("--loop-alpha-on", type=float, default=0.5)
     parser.add_argument("--print-every", type=int, default=10)
     parser.add_argument("--no-records", action="store_true")
     return parser.parse_args()
@@ -107,41 +168,185 @@ def decode_answer(tokenizer, answer_ids):
     )
 
 
-def forward_logits(core_model, x, prefix_embeds, prefix_length):
+def compute_prefix_kv_cache(core_model, prefix_embeds):
+    output = core_model(None, input_embeddings=prefix_embeds, use_cache=True)
+    return output.attn_key_values
+
+
+def forward_answer_logits(core_model, x, prefix_embeds, prefix_length, prefix_kv_cache=None):
+    if prefix_kv_cache is not None:
+        answer_embeds = core_model.transformer.wte(x[:, prefix_length:])
+        output = core_model(None, input_embeddings=answer_embeds, past_key_values=prefix_kv_cache)
+        return output.logits.to(x.device)
     current_embeds = core_model.transformer.wte(x)
     current_embeds[:, :prefix_length] = prefix_embeds
-    return core_model(None, input_embeddings=current_embeds).logits
+    return core_model(None, input_embeddings=current_embeds).logits[:, prefix_length:].to(x.device)
 
 
-def answer_position_list(seq_positions, prefix_length):
-    return [
-        int(seq_pos - prefix_length)
-        for seq_pos in seq_positions.detach().cpu().tolist()
-        if int(seq_pos) >= int(prefix_length)
-    ]
+def apply_nucleus(probs, nucleus_p):
+    if nucleus_p >= 1.0:
+        return probs
+    if nucleus_p <= 0.0:
+        raise ValueError("--nucleus-p must be in (0, 1].")
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+    top_p_mask = cumulative_probs <= nucleus_p
+    top_p_mask[..., 0] = True
+    nucleus_probs = sorted_probs * top_p_mask
+    nucleus_probs = nucleus_probs / nucleus_probs.sum(dim=-1, keepdim=True).clamp_min(1e-30)
+    return torch.zeros_like(probs).scatter_(-1, sorted_indices, nucleus_probs)
 
 
-def build_remask_scores(
+def sample_categorical(categorical_probs, temperature):
+    categorical_probs = categorical_probs.to(torch.float64).clamp_min(0.0)
+    if temperature == 0:
+        return categorical_probs.argmax(dim=-1)
+    noise = torch.rand_like(categorical_probs, dtype=torch.float64).clamp_min(1e-30)
+    gumbel_norm = (-torch.log(noise)) ** float(temperature)
+    return (categorical_probs / gumbel_norm).argmax(dim=-1)
+
+
+def masked_softmax(values, mask):
+    scores = values.to(torch.float64).masked_fill(~mask, -torch.inf)
+    if not torch.isfinite(scores).any():
+        return torch.zeros_like(scores)
+    return torch.softmax(scores, dim=-1)
+
+
+def update_confidence(confidence, x_prev, x_next, p_x0):
+    unmask_mask = (x_prev == MASK_TOKEN_ID) & (x_next != MASK_TOKEN_ID)
+    if unmask_mask.any():
+        selected_probs = torch.gather(
+            p_x0,
+            dim=-1,
+            index=x_next.clamp_min(0).unsqueeze(-1),
+        ).squeeze(-1)
+        confidence[unmask_mask] = -selected_probs[unmask_mask].to(confidence.dtype)
+
+    remask_mask = (x_prev != MASK_TOKEN_ID) & (x_next == MASK_TOKEN_ID)
+    confidence[remask_mask] = -torch.inf
+    return confidence
+
+
+def remdm_q_from_sigma(p_x0, x, alpha_t, alpha_s, sigma):
+    if not torch.is_tensor(sigma):
+        sigma = torch.full(x.shape, float(sigma), dtype=p_x0.dtype, device=x.device)
+    else:
+        sigma = sigma.to(dtype=p_x0.dtype, device=x.device)
+    sigma = sigma.clamp(0.0, 1.0)
+
+    q_unmasked = p_x0 * (1.0 - sigma.unsqueeze(-1))
+    q_unmasked[..., MASK_TOKEN_ID] = sigma
+
+    denom = max(1e-12, 1.0 - float(alpha_t))
+    coef = (float(alpha_s) - (1.0 - sigma.unsqueeze(-1)) * float(alpha_t)) / denom
+    mask_prob = (1.0 - float(alpha_s) - sigma * float(alpha_t)) / denom
+    q_masked = p_x0 * coef
+    q_masked[..., MASK_TOKEN_ID] = mask_prob
+
+    copy_flag = x != MASK_TOKEN_ID
+    q = torch.where(copy_flag.unsqueeze(-1), q_unmasked, q_masked)
+    return q.clamp_min(0.0)
+
+
+def mdlm_update(x, p_x0, t, dt, temperature):
+    move_chance_t = float(t)
+    move_chance_s = max(float(t) - float(dt), 0.0)
+    q_xs = p_x0 * max(move_chance_t - move_chance_s, 0.0)
+    q_xs[..., MASK_TOKEN_ID] = move_chance_s
+    sampled = sample_categorical(q_xs, temperature=temperature)
+    copy_flag = x != MASK_TOKEN_ID
+    return torch.where(copy_flag, x, sampled), {
+        "sigma": None,
+        "sigma_max": None,
+        "mode": "mdlm",
+    }
+
+
+def loop_move_chances(t, dt, loop_t_on, loop_t_off, loop_alpha_on):
+    if t > loop_t_on:
+        move_t = 1.0 - (1.0 - t) * loop_alpha_on / max(1e-12, 1.0 - loop_t_on)
+        move_s = 1.0 - (1.0 - t + dt) * loop_alpha_on / max(1e-12, 1.0 - loop_t_on)
+    elif t <= loop_t_off:
+        move_t = t * (1.0 - loop_alpha_on) / max(1e-12, loop_t_off)
+        move_s = (t - dt) * (1.0 - loop_alpha_on) / max(1e-12, loop_t_off)
+    else:
+        return None, None
+    return max(move_t, 0.0), max(move_s, 0.0)
+
+
+def remdm_update(
     x,
+    p_x0,
     confidence,
-    answer_slice,
-    filled_answer_mask,
-    fill_answer_positions,
-    remask_scope,
+    sampler,
+    t,
+    dt,
+    eta,
+    temperature,
+    loop_t_on,
+    loop_t_off,
+    loop_alpha_on,
 ):
-    answer_confidence = confidence[0, answer_slice].to(torch.float64)
-    scores = torch.full_like(answer_confidence, float("inf"), dtype=torch.float64)
+    if sampler == "mdlm":
+        x_next, meta = mdlm_update(x, p_x0, t, dt, temperature)
+        return x_next, confidence, meta
 
-    if remask_scope == "new":
-        if fill_answer_positions.numel() > 0:
-            scores[fill_answer_positions] = answer_confidence[fill_answer_positions]
-        return scores
+    if sampler == "remdm-loop":
+        move_t, move_s = loop_move_chances(t, dt, loop_t_on, loop_t_off, loop_alpha_on)
+        if move_t is not None:
+            q_xs = p_x0 * max(move_t - move_s, 0.0)
+            q_xs[..., MASK_TOKEN_ID] = move_s
+            sampled = sample_categorical(q_xs, temperature=temperature)
+            copy_flag = x != MASK_TOKEN_ID
+            x_next = torch.where(copy_flag, x, sampled)
+            confidence = update_confidence(confidence, x, x_next, p_x0)
+            return x_next, confidence, {
+                "sigma": None,
+                "sigma_max": None,
+                "mode": "loop-mdlm",
+                "move_chance_t": move_t,
+                "move_chance_s": move_s,
+            }
 
-    if remask_scope == "filled":
-        scores[filled_answer_mask] = answer_confidence[filled_answer_mask]
-        return scores
+    alpha_t = max(0.0, 1.0 - float(t))
+    alpha_s = max(0.0, 1.0 - (float(t) - float(dt)))
+    if alpha_t > 0.0:
+        sigma_max = min(1.0, max(0.0, (1.0 - alpha_s) / alpha_t))
+    else:
+        sigma_max = 1.0
 
-    raise ValueError(f"Unsupported remask_scope: {remask_scope}")
+    if sampler == "remdm-cap":
+        sigma = min(float(eta), sigma_max)
+        q_xs = remdm_q_from_sigma(p_x0, x, alpha_t, alpha_s, sigma)
+    elif sampler == "remdm-rescale":
+        sigma = float(eta) * sigma_max
+        q_xs = remdm_q_from_sigma(p_x0, x, alpha_t, alpha_s, sigma)
+    elif sampler == "remdm-conf":
+        eligible = x != MASK_TOKEN_ID
+        eta_by_pos = masked_softmax(confidence, eligible)
+        sigma = eta_by_pos * sigma_max
+        q_xs = remdm_q_from_sigma(p_x0, x, alpha_t, alpha_s, sigma)
+    elif sampler == "remdm-loop":
+        sigma = float(eta)
+        q_xs = remdm_q_from_sigma(
+            p_x0,
+            x,
+            alpha_t=float(loop_alpha_on),
+            alpha_s=float(loop_alpha_on),
+            sigma=sigma,
+        )
+    else:
+        raise ValueError(f"Unsupported sampler: {sampler}")
+
+    x_next = sample_categorical(q_xs, temperature=temperature)
+    confidence = update_confidence(confidence, x, x_next, p_x0)
+    sigma_value = float(sigma.mean().item()) if torch.is_tensor(sigma) else float(sigma)
+    return x_next, confidence, {
+        "sigma": sigma_value,
+        "sigma_max": float(sigma_max),
+        "mode": sampler,
+    }
 
 
 @torch.no_grad()
@@ -153,12 +358,16 @@ def generate_with_remdm(
     block_length,
     step_per_block,
     step_ratio,
-    proposal_per_step,
-    remask_per_step,
     temperature,
     remasking,
-    remask_scope,
-    remask_final_step,
+    sampler,
+    eta,
+    eps,
+    nucleus_p,
+    noise_removal,
+    loop_t_on,
+    loop_t_off,
+    loop_alpha_on,
 ):
     total_steps = resolve_total_steps(
         max_new_tokens=max_new_tokens,
@@ -166,12 +375,14 @@ def generate_with_remdm(
         step_per_block=step_per_block,
         step_ratio=step_ratio,
     )
-    if proposal_per_step <= 0:
-        raise ValueError("proposal_per_step must be > 0.")
-    if remask_per_step < 0:
-        raise ValueError("remask_per_step must be >= 0.")
-    if proposal_per_step <= remask_per_step and not remask_final_step:
-        raise ValueError("proposal_per_step should be greater than remask_per_step.")
+    if not (0.0 < eps < 1.0):
+        raise ValueError("--eps must be in (0, 1).")
+    if eta < 0.0:
+        raise ValueError("--eta must be >= 0.")
+    if not (0.0 < nucleus_p <= 1.0):
+        raise ValueError("--nucleus-p must be in (0, 1].")
+    if sampler == "remdm-loop" and not (0.0 < loop_t_off < loop_t_on < 1.0):
+        raise ValueError("--loop-t-off < --loop-t-on must both lie in (0, 1).")
 
     device = prefix_embeds.device
     batch_size, prefix_length = prefix_embeds.shape[:2]
@@ -186,135 +397,115 @@ def generate_with_remdm(
     )
     x[:, :prefix_length] = 0
     answer_slice = slice(prefix_length, prefix_length + max_new_tokens)
-    state_confidence = torch.full(
-        (max_new_tokens,),
-        float("inf"),
+    answer_x = x[:, answer_slice]
+    confidence = torch.full(
+        answer_x.shape,
+        -torch.inf,
         dtype=torch.float64,
         device=device,
     )
+
+    timesteps = torch.linspace(1.0, float(eps), total_steps + 1, device=device)
+    dt = (1.0 - float(eps)) / float(total_steps)
+    prefix_kv_cache = compute_prefix_kv_cache(core_model, prefix_embeds)
     step_records = []
 
     for step_idx in range(1, total_steps + 1):
-        mask_index = x == MASK_TOKEN_ID
-        answer_mask_index = mask_index[:, answer_slice]
-        remaining_masked = int(answer_mask_index.sum().item())
-        if remaining_masked == 0:
-            break
-
-        pre_remask_answer_positions = torch.empty(0, dtype=torch.long, device=device)
-        pre_remasked_token_ids = []
-        if remaining_masked < int(proposal_per_step):
-            filled_answer_mask = x[0, answer_slice] != MASK_TOKEN_ID
-            pre_remask_scores = torch.full_like(
-                state_confidence,
-                float("inf"),
-                dtype=torch.float64,
-            )
-            pre_remask_scores[filled_answer_mask] = state_confidence[filled_answer_mask]
-            pre_remask_count = min(
-                int(proposal_per_step) - remaining_masked,
-                int(torch.isfinite(pre_remask_scores).sum().item()),
-            )
-            if pre_remask_count > 0:
-                pre_remask_answer_positions = torch.topk(
-                    pre_remask_scores,
-                    k=pre_remask_count,
-                    largest=False,
-                ).indices
-                pre_remasked_token_ids = [
-                    int(token_id)
-                    for token_id in x[0, prefix_length + pre_remask_answer_positions].detach().cpu().tolist()
-                ]
-                x[0, prefix_length + pre_remask_answer_positions] = MASK_TOKEN_ID
-                mask_index = x == MASK_TOKEN_ID
-                answer_mask_index = mask_index[:, answer_slice]
-                remaining_masked = int(answer_mask_index.sum().item())
-
-        logits = forward_logits(core_model, x, prefix_embeds, prefix_length)
-        logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
-        proposal_ids = torch.argmax(logits_with_noise, dim=-1)
-        confidence = compute_remasking_confidence(logits, proposal_ids, remasking)
-        state_confidence = confidence[0, answer_slice].detach().to(torch.float64)
-        proposal_ids = torch.where(mask_index, proposal_ids, x)
-
-        masked_confidence = torch.where(mask_index, confidence, -torch.inf)
-        fill_count = min(int(proposal_per_step), remaining_masked)
-        _, fill_seq_positions = torch.topk(masked_confidence[0], k=fill_count)
-        x[0, fill_seq_positions] = proposal_ids[0, fill_seq_positions]
-        fill_answer_positions = torch.tensor(
-            answer_position_list(fill_seq_positions, prefix_length),
-            dtype=torch.long,
-            device=device,
+        t = float(timesteps[step_idx - 1].item())
+        answer_logits = forward_answer_logits(
+            core_model,
+            x,
+            prefix_embeds,
+            prefix_length,
+            prefix_kv_cache=prefix_kv_cache,
         )
+        p_x0 = F.softmax(answer_logits.to(torch.float64), dim=-1)
+        p_x0 = apply_nucleus(p_x0, nucleus_p)
+        candidate_ids = p_x0.argmax(dim=-1)
+        proposal_confidence = compute_remasking_confidence(
+            answer_logits,
+            candidate_ids,
+            remasking,
+        )[0].detach().to(torch.float64)
 
-        remask_answer_positions = torch.empty(0, dtype=torch.long, device=device)
-        remasked_token_ids = []
-        should_remask = (
-            remask_per_step > 0
-            and (remask_final_step or step_idx < total_steps)
+        prev_answer_x = answer_x.clone()
+        next_answer_x, confidence, update_meta = remdm_update(
+            x=answer_x,
+            p_x0=p_x0,
+            confidence=confidence,
+            sampler=sampler,
+            t=t,
+            dt=dt,
+            eta=eta,
+            temperature=temperature,
+            loop_t_on=loop_t_on,
+            loop_t_off=loop_t_off,
+            loop_alpha_on=loop_alpha_on,
         )
-        if should_remask:
-            filled_answer_mask = x[0, answer_slice] != MASK_TOKEN_ID
-            remask_scores = build_remask_scores(
-                x=x,
-                confidence=confidence,
-                answer_slice=answer_slice,
-                filled_answer_mask=filled_answer_mask,
-                fill_answer_positions=fill_answer_positions,
-                remask_scope=remask_scope,
-            )
-            available = int(torch.isfinite(remask_scores).sum().item())
-            remask_count = min(int(remask_per_step), available)
-            if remask_count > 0:
-                remask_answer_positions = torch.topk(
-                    remask_scores,
-                    k=remask_count,
-                    largest=False,
-                ).indices
-                remasked_token_ids = [
-                    int(token_id)
-                    for token_id in x[0, prefix_length + remask_answer_positions].detach().cpu().tolist()
-                ]
-                x[0, prefix_length + remask_answer_positions] = MASK_TOKEN_ID
+        x[:, answer_slice] = next_answer_x
+        answer_x = x[:, answer_slice]
 
-        candidate_answer_ids = proposal_ids[0, answer_slice].detach().cpu().tolist()
-        state_answer_ids = x[0, answer_slice].detach().cpu().tolist()
+        changed_mask = prev_answer_x != next_answer_x
+        filled_mask = (prev_answer_x == MASK_TOKEN_ID) & (next_answer_x != MASK_TOKEN_ID)
+        remasked_mask = (prev_answer_x != MASK_TOKEN_ID) & (next_answer_x == MASK_TOKEN_ID)
         step_records.append(
             {
                 "step": int(step_idx),
-                "num_proposed": int(fill_count),
-                "pre_remasked_answer_positions": [
-                    int(pos) for pos in pre_remask_answer_positions.detach().cpu().tolist()
-                ],
-                "pre_remasked_token_ids": pre_remasked_token_ids,
-                "num_remasked": int(remask_answer_positions.numel()),
+                "phase": "remdm",
+                "t": t,
+                "dt": dt,
+                "mode": update_meta["mode"],
+                "sigma": update_meta["sigma"],
+                "sigma_max": update_meta["sigma_max"],
+                "num_changed": int(changed_mask.sum().item()),
+                "num_filled": int(filled_mask.sum().item()),
+                "num_remasked": int(remasked_mask.sum().item()),
                 "filled_answer_positions": [
-                    int(pos) for pos in fill_answer_positions.detach().cpu().tolist()
+                    int(pos)
+                    for pos in filled_mask[0].nonzero(as_tuple=False).flatten().detach().cpu().tolist()
                 ],
                 "remasked_answer_positions": [
-                    int(pos) for pos in remask_answer_positions.detach().cpu().tolist()
+                    int(pos)
+                    for pos in remasked_mask[0].nonzero(as_tuple=False).flatten().detach().cpu().tolist()
                 ],
-                "remasked_token_ids": remasked_token_ids,
-                "candidate_text": decode_answer(tokenizer, candidate_answer_ids),
-                "state_text": decode_answer(tokenizer, state_answer_ids),
-                "num_masked_after_step": int((x[:, answer_slice] == MASK_TOKEN_ID).sum().item()),
+                "candidate_text": decode_answer(tokenizer, candidate_ids[0].detach().cpu().tolist()),
+                "state_text": decode_answer(tokenizer, answer_x[0].detach().cpu().tolist()),
+                "num_masked_after_step": int((answer_x == MASK_TOKEN_ID).sum().item()),
+                "proposal_confidence_mean": float(proposal_confidence.mean().item()),
             }
         )
 
-    final_answer_ids = x[0, answer_slice].detach().cpu().tolist()
+    if noise_removal and (answer_x == MASK_TOKEN_ID).any():
+        answer_logits = forward_answer_logits(
+            core_model,
+            x,
+            prefix_embeds,
+            prefix_length,
+            prefix_kv_cache=prefix_kv_cache,
+        )
+        denoised = answer_logits.argmax(dim=-1)
+        answer_mask = answer_x == MASK_TOKEN_ID
+        answer_x = torch.where(answer_mask, denoised, answer_x)
+        x[:, answer_slice] = answer_x
+
+    final_answer_ids = answer_x[0].detach().cpu().tolist()
     final_text = decode_answer(tokenizer, final_answer_ids)
     meta = {
         "max_new_tokens": int(max_new_tokens),
         "block_length": int(block_length),
         "total_steps": int(total_steps),
         "executed_steps": int(len(step_records)),
-        "proposal_per_step": int(proposal_per_step),
-        "remask_per_step": int(remask_per_step),
-        "remask_scope": remask_scope,
-        "remask_final_step": bool(remask_final_step),
+        "sampler": sampler,
+        "eta": float(eta),
+        "eps": float(eps),
+        "nucleus_p": float(nucleus_p),
+        "noise_removal": bool(noise_removal),
         "temperature": float(temperature),
         "remasking": remasking,
-        "num_masked_final": int((x[:, answer_slice] == MASK_TOKEN_ID).sum().item()),
+        "loop_t_on": float(loop_t_on) if sampler == "remdm-loop" else None,
+        "loop_t_off": float(loop_t_off) if sampler == "remdm-loop" else None,
+        "loop_alpha_on": float(loop_alpha_on) if sampler == "remdm-loop" else None,
+        "num_masked_final": int((answer_x == MASK_TOKEN_ID).sum().item()),
     }
     return {
         "final_text": final_text,
@@ -331,6 +522,7 @@ def main():
 
     restore_compile = maybe_disable_torch_compile()
 
+    from llava.conversation import conv_templates
     from llava.model.builder import load_pretrained_model
 
     vision_kwargs = dict(
@@ -350,12 +542,16 @@ def main():
         vision_kwargs=vision_kwargs,
         torch_dtype=args.torch_dtype,
     )
+    if args.conv_template in conv_templates:
+        conv_templates[args.conv_template].tokenizer = tokenizer
     model.eval()
     model.tie_weights()
     model.to(get_torch_dtype(args.torch_dtype))
     core_model = model.get_model()
+    if hasattr(core_model, "set_activation_checkpointing"):
+        core_model.set_activation_checkpointing(None)
 
-    dataset = datasets.load_dataset(args.dataset_path, split=args.split)
+    dataset = load_postvrg_dataset(args)
     if args.domain_filter:
         dataset = dataset.filter(lambda row: row.get("domain") == args.domain_filter)
     if args.sample_mode == "random":
@@ -375,8 +571,7 @@ def main():
     written = 0
     correct_total = 0
 
-    record_file = records_path.open("w", encoding="utf-8") if write_records else None
-    try:
+    with (records_path.open("w", encoding="utf-8") if write_records else contextlib.nullcontext()) as fout:
         for dataset_index, doc in enumerate(dataset):
             if doc.get("image") is None:
                 continue
@@ -397,12 +592,16 @@ def main():
                 block_length=args.block_length,
                 step_per_block=args.step_per_block,
                 step_ratio=args.step_ratio,
-                proposal_per_step=args.proposal_per_step,
-                remask_per_step=args.remask_per_step,
                 temperature=args.temperature,
                 remasking=args.remasking,
-                remask_scope=args.remask_scope,
-                remask_final_step=args.remask_final_step,
+                sampler=args.sampler,
+                eta=args.eta,
+                eps=args.eps,
+                nucleus_p=args.nucleus_p,
+                noise_removal=args.noise_removal,
+                loop_t_on=args.loop_t_on,
+                loop_t_off=args.loop_t_off,
+                loop_alpha_on=args.loop_alpha_on,
             )
             elapsed = time.time() - t0
             total_elapsed += elapsed
@@ -419,6 +618,8 @@ def main():
                     "answer": doc["answer"],
                     "domain": doc["domain"],
                     "topic": doc["topic"],
+                    "benchmark": doc.get("benchmark"),
+                    "raw_index": doc.get("raw_index"),
                     "prompt": prompt,
                     "elapsed_sec": elapsed,
                     "final_text": run_output["final_text"],
@@ -427,8 +628,8 @@ def main():
                     "step_records": run_output["step_records"],
                     "meta": run_output["meta"],
                 }
-                record_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-                record_file.flush()
+                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
+                fout.flush()
             written += 1
 
             if args.print_every > 0 and written % args.print_every == 0:
@@ -437,12 +638,11 @@ def main():
                     f"final={final_correct} elapsed={elapsed:.2f}s",
                     flush=True,
                 )
-    finally:
-        if record_file is not None:
-            record_file.close()
 
     summary = {
         "dataset_path": args.dataset_path,
+        "dataset_name": args.dataset_name,
+        "benchmark": args.benchmark,
         "split": args.split,
         "start_index": args.start_index,
         "domain_filter": args.domain_filter,
@@ -458,12 +658,16 @@ def main():
             "block_length": args.block_length,
             "step_per_block": args.step_per_block,
             "step_ratio": args.step_ratio,
-            "proposal_per_step": args.proposal_per_step,
-            "remask_per_step": args.remask_per_step,
-            "remask_scope": args.remask_scope,
-            "remask_final_step": args.remask_final_step,
             "temperature": args.temperature,
             "remasking": args.remasking,
+            "sampler": args.sampler,
+            "eta": args.eta,
+            "eps": args.eps,
+            "nucleus_p": args.nucleus_p,
+            "noise_removal": args.noise_removal,
+            "loop_t_on": args.loop_t_on if args.sampler == "remdm-loop" else None,
+            "loop_t_off": args.loop_t_off if args.sampler == "remdm-loop" else None,
+            "loop_alpha_on": args.loop_alpha_on if args.sampler == "remdm-loop" else None,
         },
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -475,4 +679,5 @@ def main():
 
 
 if __name__ == "__main__":
+    apply_remdm_defaults()
     main()

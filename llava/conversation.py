@@ -379,8 +379,10 @@ conv_llava_llama_2 = Conversation(
 )
 
 def safe_load_tokenizer(tokenizer_id):
+    if os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1":
+        return None
     try:
-        return AutoTokenizer.from_pretrained(tokenizer_id)
+        return AutoTokenizer.from_pretrained(tokenizer_id, local_files_only=True, trust_remote_code=False)
     except Exception:
         return None
 
@@ -485,7 +487,7 @@ conv_dream = Conversation(
     sep="<|im_end|>",
     sep_style=SeparatorStyle.LLAMA_3,
     tokenizer_id="Dream-org/Dream-v0-Instruct-7B",
-    tokenizer=AutoTokenizer.from_pretrained("Dream-org/Dream-v0-Instruct-7B",trust_remote_code=True),
+    tokenizer=safe_load_tokenizer("Dream-org/Dream-v0-Instruct-7B"),
     stop_token_ids=[151643],
 )
 
