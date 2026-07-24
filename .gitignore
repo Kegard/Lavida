@@ -8,9 +8,9 @@ dist
 *.log
 *.log.*
 *.html*
-*.csv*
-*.json
-*.jsonl
+# *.csv*
+# *.json
+# *.jsonl
 
 
 # Data
@@ -125,3 +125,21 @@ nohup.out
 
 # Nested repository metadata copied from external projects
 **/.git/
+
+
+# 额外的文件夹
+AdaptRVRG
+Attention
+Causal_Analysis
+Draft
+Entropy
+M3CoT\Proposal
+M3CoT\StepMask
+M3CoT\benchmark
+M3CoT\PostMaSK
+PDM
+Scale_Attention
+Sink
+VRG
+PostVRG-main-to-push.bundle
+README_inference_optimization.md
